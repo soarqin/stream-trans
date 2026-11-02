@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>StreamTrans 文字输出</title>
+  <style>/*__DEFAULT_STYLE__*/</style>
+  <style id="custom-style"></style>
+</head>
+<body>
+  <main class="output" aria-label="识别与翻译结果">
+    <div id="output-status" class="status" role="status">等待连接</div>
+    <div id="output-rows" class="rows" aria-live="polite" aria-relevant="additions text"></div>
+    <div id="output-error" class="error" role="alert" hidden></div>
+  </main>
+  <script>
+    (() => {
+      const rows = document.getElementById('output-rows');
+      const status = document.getElementById('output-status');
+      const error = document.getElementById('output-error');
+      const style = document.getElementById('custom-style');
+      let previousRows = '';
+      let previousCss = '';
+
+      function render(state) {
+        const follow = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 64;
+        status.textContent = state.status || '';
+        error.textContent = state.error ? '错误：' + state.error : '';
+        error.hidden = !state.error;
+        const original = state.show_original || state.mode === 'transcribe';
+        const translated = state.show_translation && state.mode !== 'transcribe';
+        const key = JSON.stringify([original, translated, state.rows]);
+        if (key === previousRows) {
+          if (follow && state.error) window.scrollTo(0, document.documentElement.scrollHeight);
+          return;
+        }
+        previousRows = key;
+        const content = document.createDocumentFragment();
+        for (const row of state.rows || []) {
+          if ((!original || !row.text) && (!translated || !row.translation)) continue;
+          const article = document.createElement('article');
+          article.className = 'output-row';
+          article.dataset.segmentId = String(row.id);
+          const time = document.createElement('div');
+          time.className = 'timestamp';
+          time.textContent = (row.start_ms / 1000).toFixed(2) + '–' + (row.end_ms / 1000).toFixed(2) + ' s';
+          article.append(time);
+          if (original && row.text) {
+            const paragraph = document.createElement('p');
+            paragraph.className = 'original';
+            paragraph.textContent = row.text;
+            article.append(paragraph);
+          }
+          if (translated && row.translation) {
+            const paragraph = document.createElement('p');
+            paragraph.className = 'translation';
+            paragraph.textContent = row.translation;
+            article.append(paragraph);
+          }
+          content.append(article);
+        }
+        rows.replaceChildren(content);
+        if (follow) window.scrollTo(0, document.documentElement.scrollHeight);
+      }
+
+      async function get(path) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        try {
+          const response = await fetch(path, {cache: 'no-store', signal: controller.signal});
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          return response;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      async function refreshState() {
+        try {
+          render(await (await get('/api/state')).json());
+        } catch (_) {
+          status.textContent = '输出服务连接中断，正在重试';
+        }
+      }
+
+      async function refreshCss() {
+        try {
+          const css = await (await get('/style.css')).text();
+          if (css !== previousCss) {
+            style.textContent = css;
+            previousCss = css;
+          }
+        } catch (_) {
+          // Keep the inline default or last successfully loaded user stylesheet.
+        }
+      }
+
+      async function refresh() {
+        await Promise.all([refreshState(), refreshCss()]);
+        setTimeout(refresh, 500);
+      }
+      refresh();
+    })();
+  </script>
+</body>
+</html>

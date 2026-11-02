@@ -1,0 +1,40 @@
+/* StreamTrans 输出模板。编辑本文件后，网页会自动重新读取，无需重启客户端。
+   可覆盖 .original（原文）、.translation（译文）、.timestamp（时间）和 .status。
+   OBS 浏览器源默认透明背景；使用 background 为画面增加底色。 */
+:root {
+  color-scheme: light dark;
+  --output-text: #202124;
+  --output-muted: #5f6368;
+  --output-error: #b3261e;
+  --output-font-size: 24px;
+  --output-line-height: 1.5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --output-text: #f1f3f4;
+    --output-muted: #bdc1c6;
+    --output-error: #ffb4ab;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: transparent; }
+body {
+  color: var(--output-text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: var(--output-font-size);
+  line-height: var(--output-line-height);
+  overflow-wrap: anywhere;
+}
+.output { width: 100%; padding: 16px; }
+.output-row + .output-row { margin-top: 18px; }
+.original, .translation { margin: 0; white-space: pre-wrap; }
+.translation { font-weight: 600; }
+.original + .translation { margin-top: 4px; }
+.timestamp { display: none; color: var(--output-muted); font-size: 12px; }
+.status { margin-bottom: 8px; color: var(--output-muted); font-size: 12px; }
+.error { margin-top: 12px; color: var(--output-error); font-size: 16px; white-space: pre-wrap; }
+[hidden] { display: none !important; }
+@media (max-width: 480px) {
+  .output { padding: 12px; }
+  body { font-size: 20px; }
+}

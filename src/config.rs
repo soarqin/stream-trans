@@ -1,0 +1,141 @@
+use std::{net::SocketAddr, path::PathBuf};
+
+use anyhow::{Result, ensure};
+use clap::Parser;
+
+#[derive(Debug, Clone, Parser)]
+#[command(version, about = "本地 GPU 语音识别与翻译服务")]
+pub struct Config {
+    #[arg(long, default_value = "127.0.0.1:3000")]
+    pub bind: SocketAddr,
+    #[arg(long, default_value_os_t = default_cache_dir())]
+    pub cache_dir: PathBuf,
+    #[arg(long, default_value_os_t = default_asr_library())]
+    pub asr_library: PathBuf,
+    #[arg(long, default_value_os_t = default_llama_server())]
+    pub llama_server: PathBuf,
+    #[arg(long, default_value_os_t = default_ffmpeg())]
+    pub ffmpeg: PathBuf,
+    /// CUDA 设备编号。
+    #[arg(long, default_value_t = 0)]
+    pub gpu: u32,
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=600))]
+    pub max_audio_seconds: u32,
+    /// 连续录音的总时长上限（秒）；0 表示不限，音频缓冲仍有界。
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=86_400))]
+    pub max_stream_seconds: u32,
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(2048..=4096))]
+    pub context_size: u32,
+    #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=3072))]
+    pub max_tokens: u32,
+    /// UTF-8 TSV 术语表，三列为 source、target_language、translation；启动时加载一次。
+    #[arg(long)]
+    pub glossary: Option<PathBuf>,
+    /// 完整术语表的模型 token 上限；不会自动筛选或截断条目。
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    pub glossary_max_tokens: u32,
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    pub inference_timeout_seconds: u64,
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    pub startup_timeout_seconds: u64,
+    #[arg(long, default_value = "05201c46f1c38592b1567f857c0d56eab3d0d8ef")]
+    pub asr_revision: String,
+    #[arg(long, default_value = "e97e6af0ec0950385644d7c0a8e5c899071f722b")]
+    pub llm_revision: String,
+    #[arg(long, default_value = "f9a8b8274674755d925277e27063869038d41515")]
+    pub vad_revision: String,
+    /// 仅下载模型，不加载 GPU 或启动 HTTP 服务。
+    #[arg(long)]
+    pub download_only: bool,
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_tokens + 1024 < self.context_size,
+            "context-size 必须大于 max-tokens + 1024，为输入文本保留空间"
+        );
+        ensure!(
+            self.bind.ip().is_loopback(),
+            "此版本仅允许绑定回环地址；跨机器访问请通过带认证的反向代理"
+        );
+        Ok(())
+    }
+}
+
+fn default_asr_library() -> PathBuf {
+    let packaged = bundled_path(if cfg!(windows) {
+        "runtime/asr/transcribe.dll"
+    } else {
+        "runtime/asr/libtranscribe.so"
+    });
+    if packaged.is_file() {
+        return packaged;
+    }
+    if cfg!(windows) {
+        ".tools/transcribe/transcribe-native-windows-x86_64-cuda/transcribe.dll".into()
+    } else {
+        ".tools/transcribe/libtranscribe.so".into()
+    }
+}
+
+fn bundled_path(relative: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(relative)))
+        .unwrap_or_else(|| relative.into())
+}
+
+fn default_llama_server() -> PathBuf {
+    let relative = if cfg!(windows) {
+        "runtime/llama/llama-server.exe"
+    } else {
+        "runtime/llama/llama-server"
+    };
+    let packaged = bundled_path(relative);
+    if packaged.is_file() {
+        packaged
+    } else if cfg!(windows) {
+        ".tools/llama/llama-server.exe".into()
+    } else {
+        ".tools/llama/llama-server".into()
+    }
+}
+
+fn default_ffmpeg() -> PathBuf {
+    let packaged = bundled_path(if cfg!(windows) {
+        "runtime/ffmpeg/ffmpeg.exe"
+    } else {
+        "runtime/ffmpeg/ffmpeg"
+    });
+    if packaged.is_file() {
+        packaged
+    } else {
+        "ffmpeg".into()
+    }
+}
+
+fn default_cache_dir() -> PathBuf {
+    if bundled_path("runtime").is_dir() {
+        bundled_path("models")
+    } else {
+        "models".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hy_mt_defaults_preserve_translation_output_budget() {
+        let config = Config::try_parse_from(["streamtrans"]).unwrap();
+        assert_eq!(config.context_size, 4096);
+        assert_eq!(config.max_tokens, 2048);
+        assert_eq!(
+            config.llm_revision,
+            "e97e6af0ec0950385644d7c0a8e5c899071f722b"
+        );
+        assert!(Config::try_parse_from(["streamtrans", "--llm-thinking"]).is_err());
+    }
+}

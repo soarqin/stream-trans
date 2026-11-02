@@ -1,0 +1,14 @@
+/target/
+/dist/
+/models/
+/.venv/
+/.tools/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+*.flac
+*.gguf
+*.safetensors
+*.pt
+*.log
