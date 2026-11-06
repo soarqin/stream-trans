@@ -19,8 +19,14 @@
       const status = document.getElementById('output-status');
       const error = document.getElementById('output-error');
       const style = document.getElementById('custom-style');
+      const parameters = new URLSearchParams(window.location.search);
+      const latestOnly = parameters.get('mode') === 'latest';
+      const timeout = Number(parameters.get('timeout'));
+      const timeoutMs = (Number.isFinite(timeout) && timeout > 0 && timeout <= 86400 ? timeout : 5) * 1000;
+      document.body.classList.toggle('latest-only', latestOnly);
       let previousRows = '';
       let previousCss = '';
+      let hideTimer;
 
       function render(state) {
         const follow = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 64;
@@ -29,14 +35,27 @@
         error.hidden = !state.error;
         const original = state.show_original || state.mode === 'transcribe';
         const translated = state.show_translation && state.mode !== 'transcribe';
-        const key = JSON.stringify([original, translated, state.rows]);
+        let visibleRows = state.rows || [];
+        if (latestOnly) {
+          clearTimeout(hideTimer);
+          const latest = visibleRows[visibleRows.length - 1];
+          const remaining = latest ? latest.updated_at_ms + timeoutMs - Date.now() : 0;
+          visibleRows = remaining > 0 ? [latest] : [];
+          if (visibleRows.length) {
+            hideTimer = setTimeout(() => {
+              rows.replaceChildren();
+              previousRows = '';
+            }, remaining);
+          }
+        }
+        const key = JSON.stringify([original, translated, visibleRows]);
         if (key === previousRows) {
           if (follow && state.error) window.scrollTo(0, document.documentElement.scrollHeight);
           return;
         }
         previousRows = key;
         const content = document.createDocumentFragment();
-        for (const row of state.rows || []) {
+        for (const row of visibleRows) {
           if ((!original || !row.text) && (!translated || !row.translation)) continue;
           const article = document.createElement('article');
           article.className = 'output-row';

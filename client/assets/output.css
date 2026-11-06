@@ -32,6 +32,7 @@ body {
 .original + .translation { margin-top: 4px; }
 .timestamp { display: none; color: var(--output-muted); font-size: 12px; }
 .status { margin-bottom: 8px; color: var(--output-muted); font-size: 12px; }
+.latest-only .status { display: none; }
 .error { margin-top: 12px; color: var(--output-error); font-size: 16px; white-space: pre-wrap; }
 [hidden] { display: none !important; }
 @media (max-width: 480px) {

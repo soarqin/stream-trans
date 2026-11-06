@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -28,6 +29,7 @@ pub struct OutputRow {
     pub end_ms: u64,
     pub text: String,
     pub translation: Option<String>,
+    pub updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +156,10 @@ impl OutputStore {
                 );
                 self.update(|state| {
                     if let Some(row) = state.rows.iter_mut().find(|row| row.id == id) {
+                        let text_changed =
+                            (kind == "transcript" || !text.is_empty()) && row.text != text;
+                        let translation_changed =
+                            translation.is_some() && row.translation != translation;
                         row.start_ms = start_ms;
                         row.end_ms = end_ms;
                         if kind == "transcript" || !text.is_empty() {
@@ -162,6 +168,9 @@ impl OutputStore {
                         if translation.is_some() {
                             row.translation = translation;
                         }
+                        if text_changed || translation_changed {
+                            row.updated_at_ms = unix_time_ms();
+                        }
                     } else {
                         state.rows.push(OutputRow {
                             id,
@@ -169,6 +178,7 @@ impl OutputStore {
                             end_ms,
                             text,
                             translation,
+                            updated_at_ms: unix_time_ms(),
                         });
                         state.rows.sort_by_key(|row| row.id);
                     }
@@ -208,6 +218,13 @@ impl OutputStore {
             bytes -= row_bytes(&state.rows.remove(0));
         }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn row_bytes(row: &OutputRow) -> usize {
@@ -380,6 +397,41 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.snapshot().rows.len(), count);
+        Ok(())
+    }
+
+    #[test]
+    fn timestamps_change_only_with_result_content_and_keep_segment_order() -> Result<()> {
+        let store = OutputStore::new();
+        store.apply_event(&event(1, "第一句"))?;
+        assert!(store.snapshot().rows[0].updated_at_ms > 0);
+        store.inner.lock().unwrap().rows[0].updated_at_ms = 1;
+
+        store.set_status("等待译文");
+        store.set_visibility(false, true);
+        store.apply_event(&event(1, "第一句"))?;
+        assert_eq!(store.snapshot().rows[0].updated_at_ms, 1);
+
+        store.apply_event(&event(1, "修正第一句"))?;
+        assert!(store.snapshot().rows[0].updated_at_ms > 1);
+        store.inner.lock().unwrap().rows[0].updated_at_ms = 1;
+        let translation = json!({"type":"translation","segment_id":1,"start_ms":100,"end_ms":150,"translation":"First sentence"});
+        store.apply_event(&translation)?;
+        assert!(store.snapshot().rows[0].updated_at_ms > 1);
+        store.inner.lock().unwrap().rows[0].updated_at_ms = 1;
+        store.apply_event(&translation)?;
+        assert_eq!(store.snapshot().rows[0].updated_at_ms, 1);
+
+        store.apply_event(&event(2, "第二句"))?;
+        store.inner.lock().unwrap().rows[1].updated_at_ms = 2;
+        store.apply_event(&json!({"type":"translation","segment_id":1,"start_ms":100,"end_ms":150,"translation":"Revised first sentence"}))?;
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.rows.last().unwrap().id, 2);
+        assert_eq!(snapshot.rows.last().unwrap().updated_at_ms, 2);
+        assert!(snapshot.rows[0].updated_at_ms > 1);
+        store.set_visibility(true, true);
+        assert!(render_text(&store.snapshot()).contains("第二句"));
+        assert!(render_text(&store.snapshot()).contains("Revised first sentence"));
         Ok(())
     }
 
