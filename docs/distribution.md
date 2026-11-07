@@ -83,6 +83,19 @@ ASR 和 llama.cpp 的原生库分目录存放，避免不同版本的 ggml 或 C
 
 缓存根目录默认是可执行文件旁的 `models`，需要足够的磁盘空间和写入权限。不同来源的仓库版本及缓存清单分开管理；已有 ModelScope 缓存需选择 `--model-source modelscope` 才会复用。模型加载和 CUDA 检查完成后，音频接口才开始监听，默认地址为 `127.0.0.1:3000`。音频请求和响应格式见 [README](../README.md#音频接口)。
 
+需要让其他机器直连时，设置请求 key 后显式绑定非回环地址。例如：
+
+```powershell
+$env:STREAMTRANS_REQUEST_KEY = 'your-key'
+.\start.cmd --bind 0.0.0.0:3000
+
+# 也可使用 --request-key your-key；IPv6 监听可写 --bind [::]:3000
+```
+
+未设置 key 时，只允许绑定回环地址。key 必须为 1–256 个可见 ASCII 字符，不能包含空白或为空；所有 HTTP 请求（包括 `GET /health`）和 WebSocket 握手都需携带单个 `Authorization: Bearer <key>`。缺失、错误或重复认证头返回 `401 unauthorized`，并带有 `WWW-Authenticate: Bearer`；不支持 URL 查询参数传 key。Rust 客户端可在 GUI 中填写，或通过 `--request-key` / `STREAMTRANS_REQUEST_KEY` 配置。
+
+请求 key 不提供传输加密；跨不可信网络时使用 HTTPS/WSS 反向代理，并保留认证头。客户端网页输出的本机回环限制不受此服务端选项影响。
+
 托管的 `llama-server` 使用单独的回环地址临时端口和每次启动生成的 API 密钥。调用方只访问 StreamTrans 音频接口，无须配置、启动或直接连接这个子进程。StreamTrans 退出时会清理托管子进程。
 
 ## 模型缓存与离线部署

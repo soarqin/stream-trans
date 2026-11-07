@@ -18,7 +18,11 @@
 | `target_language` | 翻译接口必填 | 与文件上传接口相同的目标语言代码或名称，例如 `ja`、`en`、`French`；最多 64 个字符；仅识别接口不接受此参数 |
 | `source_language` | 否 | `auto`（默认）、`zh`、`en`、`ja`；作为 ASR 识别提示 |
 
-语言名称按 URL 查询参数编码。参数错误在升级前返回 HTTP `400`；其他上传或实时会话占用处理许可时返回 HTTP `429 busy`。两个 WebSocket 接口与两个文件上传接口共用一个处理许可，同一时刻只处理一个会话。连接建立后，服务端首先发送 `ready`。
+语言名称按 URL 查询参数编码。设置了请求 key 的服务要求在握手中携带单个 `Authorization: Bearer <key>` 请求头；缺失、错误或重复认证头在升级前返回 HTTP `401 unauthorized`，并带有 `WWW-Authenticate: Bearer`。认证通过后，参数错误返回 HTTP `400`；其他上传或实时会话占用处理许可时返回 HTTP `429 busy`。两个 WebSocket 接口与两个文件上传接口共用一个处理许可，同一时刻只处理一个会话。连接建立后，服务端首先发送 `ready`。
+
+服务端通过 `--request-key your-key` 或 `STREAMTRANS_REQUEST_KEY` 设置 key，默认仍监听 `127.0.0.1:3000`。设置 key 后可显式用 `--bind 0.0.0.0:3000` 或 `--bind [::]:3000` 供其他机器连接；未设置 key 时只允许回环监听。key 必须为 1–256 个可见 ASCII 字符，不能包含空白或为空；本机调用同样需要认证，不支持 URL 查询参数传 key。
+
+认证头应在 WebSocket 握手时设置，而不是连接建立后发送消息。例如使用 .NET `ClientWebSocket` 时，在 `ConnectAsync` 前调用 `Options.SetRequestHeader('Authorization', 'Bearer ' + key)`。原生浏览器的 `WebSocket` API 无法直接设置此请求头，需要使用本项目 Rust 客户端或其他支持自定义握手头的客户端。跨不可信网络时使用 HTTPS/WSS 反向代理；请求 key 不提供传输加密。
 
 仅识别跳过 LLM 推理，但当前服务启动时仍预加载 ASR 和 LLM，不减少模型常驻显存。客户端选择仅识别时应更换为 `transcriptions/stream` 路径，而不是向翻译接口传递空目标语言。
 
@@ -160,6 +164,17 @@ Hy-MT2 按翻译模板直接输出译文，不提供思考模式开关。服务�
 
 [scripts/test-stream.ps1](../scripts/test-stream.ps1) 使用 .NET WebSocket 并行发送音频、接收事件，不依赖 Python。脚本读取文件并按实时速率回放，模拟持续录音客户端；文件需为 16 kHz、单声道、PCM16LE WAV。
 
+服务端设置了 key 时，脚本可通过 `-RequestKey` 指定，或从 `STREAMTRANS_REQUEST_KEY` 读取。脚本将 key 写入握手请求头，不写入 URL 或 JSONL 结果。例如连接另一台机器的服务：
+
+```powershell
+$env:STREAMTRANS_REQUEST_KEY = 'your-key'
+powershell -ExecutionPolicy Bypass -File scripts/test-stream.ps1 `
+  -Wav .\sample.wav `
+  -Uri 'ws://192.168.1.10:3000/v1/audio/translations/stream?source_language=auto&target_language=ja'
+
+# 或显式指定：在上述命令中添加 -RequestKey your-key
+```
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/test-stream.ps1 `
   -Wav .\sample.wav `
@@ -190,6 +205,8 @@ powershell -ExecutionPolicy Bypass -File scripts/test-stream.ps1 `
 脚本默认按实时速率发送。`-SendAsFastAsPossible` 可验证短文件快速提交及 `finish`，较长音频快速发送可能触发缓冲上限。JSONL 每行包含 `elapsedMs`、`sentAudioMs`、`finishSent` 和服务端 `event`，可据此核实结果是否在录音结束前返回。
 
 ## 验证记录
+
+2026-11-07，请求 key 回归通过全工作区 120 项测试，默认跳过 5 项需要本地模型的测试；Clippy `-D warnings`、格式检查及服务端和客户端发布构建通过。认证回归覆盖 HTTP 路由校验、未授权请求不读取音频或占用推理许可、真实 TCP 上两种 WebSocket 模式的拒绝与成功握手，以及客户端收到 `401` 时不发送音频、不泄漏响应中的 key。原生程序还验证了环境变量 key、无 key 的非回环配置拒绝、非法 key 不回显，以及帮助信息隐藏环境变量值。本轮未进行跨机器真实录音或 GPU 推理回归。
 
 以下具体回放、耗时和译文记录来自 2026-10-31 至 2026-11-01 的 MiniCPM5-2B 版本，保留为历史接口回归，不代表当前 Hy-MT2 的性能或翻译质量。新模型结果单独记录于 [Hy-MT2 复测](hy-mt2-20261103.md)。
 

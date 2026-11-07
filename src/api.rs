@@ -2,12 +2,15 @@ use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, State, multipart::MultipartRejection},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Multipart, Request, State, multipart::MultipartRejection},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::{
     process::Command,
     sync::Semaphore,
@@ -29,6 +32,10 @@ pub(super) struct AppState {
 }
 
 pub fn router(backend: Arc<dyn Backend>, config: Config) -> Router {
+    let key_digest: Option<[u8; 32]> = config
+        .request_key
+        .as_deref()
+        .map(|key| Sha256::digest(key.as_bytes()).into());
     Router::new()
         .route("/health", get(health))
         .route("/v1/audio/transcriptions", post(transcribe_audio))
@@ -44,6 +51,48 @@ pub fn router(backend: Arc<dyn Backend>, config: Config) -> Router {
             config,
             gate: Arc::new(Semaphore::new(1)),
         })
+        .layer(middleware::from_fn_with_state(key_digest, authorize))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+    let token = token.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("Bearer")
+        && !token.is_empty()
+        && token.len() <= 256
+        && token.bytes().all(|byte| byte.is_ascii_graphic()))
+    .then_some(token)
+}
+
+async fn authorize(
+    State(expected): State<Option<[u8; 32]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = expected {
+        let authorized = bearer_token(request.headers()).is_some_and(|token| {
+            let received: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+            bool::from(expected.ct_eq(&received))
+        });
+        if !authorized {
+            let mut response = error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "请求 key 缺失或无效，请设置正确的 Authorization: Bearer 请求头",
+            )
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            return response;
+        }
+    }
+    next.run(request).await
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -360,6 +409,7 @@ mod tests {
         translation_fails: bool,
         recognitions: AtomicUsize,
         translations: AtomicUsize,
+        health_checks: AtomicUsize,
     }
 
     #[async_trait]
@@ -383,7 +433,19 @@ mod tests {
             Ok("Hello.".into())
         }
         async fn healthy(&self) -> bool {
+            self.health_checks.fetch_add(1, Ordering::SeqCst);
             true
+        }
+
+        async fn stream(
+            &self,
+            mut input: tokio::sync::mpsc::Receiver<crate::stream::StreamInput>,
+            _: tokio::sync::mpsc::Sender<Value>,
+            _: &str,
+            _: Option<&str>,
+        ) -> anyhow::Result<()> {
+            while input.recv().await.is_some() {}
+            Ok(())
         }
     }
 
@@ -393,8 +455,205 @@ mod tests {
                 translation_fails: fails,
                 ..Default::default()
             }),
-            Config::parse_from(["streamtrans"]),
+            local_config(),
         )
+    }
+
+    fn local_config() -> Config {
+        let mut config = Config::parse_from(["streamtrans"]);
+        config.request_key = None;
+        config
+    }
+
+    fn keyed_config() -> Config {
+        let mut config = local_config();
+        config.request_key = Some("test-request-secret".into());
+        config
+    }
+
+    #[tokio::test]
+    async fn request_key_rejects_before_parsing_body_or_calling_backends() {
+        let backend = Arc::new(FakeBackend::default());
+        let app = router(backend.clone(), keyed_config());
+        for (method, uri, authorization) in [
+            ("GET", "/health", None),
+            ("POST", "/v1/audio/transcriptions", None),
+            ("POST", "/v1/audio/translations", Some("Bearer wrong-key")),
+            ("GET", "/v1/audio/transcriptions/stream", None),
+            (
+                "GET",
+                "/v1/audio/translations/stream?target_language=en",
+                None,
+            ),
+            ("GET", "/missing", None),
+            ("PUT", "/health", None),
+            ("GET", "/health?request_key=test-request-secret", None),
+            ("GET", "/health", Some("Basic test-request-secret")),
+            ("GET", "/health", Some("Bearer ")),
+            ("GET", "/health", Some("Bearer TEST-request-secret")),
+            ("GET", "/health", Some("Bearer test-request-secret ")),
+            (
+                "GET",
+                "/health",
+                Some("Bearer test-request-secret, Bearer test-request-secret"),
+            ),
+        ] {
+            let body = Body::from_stream(futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<axum::body::Bytes, std::io::Error>>> {
+                    panic!("unauthorized requests must not read an upload body")
+                },
+            ));
+            let mut request = Request::builder().method(method).uri(uri);
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+            let body = to_bytes(response.into_body(), 8192).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["code"], "unauthorized");
+            assert!(!String::from_utf8_lossy(&body).contains("test-request-secret"));
+        }
+        let mut duplicate = Request::get("/health").body(Body::empty()).unwrap();
+        for _ in 0..2 {
+            duplicate.headers_mut().append(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer test-request-secret"),
+            );
+        }
+        assert_eq!(
+            app.clone().oneshot(duplicate).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let query_only = Request::get("/health")
+            .header("x-api-key", "test-request-secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(query_only).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(backend.health_checks.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.recognitions.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.translations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn valid_request_key_reaches_http_routes_and_no_key_preserves_local_requests() {
+        let backend = Arc::new(FakeBackend::default());
+        let app = router(backend.clone(), keyed_config());
+        for (method, uri, expected) in [
+            ("GET", "/health", StatusCode::OK),
+            ("POST", "/v1/audio/transcriptions", StatusCode::BAD_REQUEST),
+            ("POST", "/v1/audio/translations", StatusCode::BAD_REQUEST),
+            (
+                "GET",
+                "/v1/audio/transcriptions/stream",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "GET",
+                "/v1/audio/translations/stream?target_language=en",
+                StatusCode::BAD_REQUEST,
+            ),
+            ("GET", "/missing", StatusCode::NOT_FOUND),
+            ("PUT", "/health", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, "bEaReR  test-request-secret")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+        assert_eq!(backend.health_checks.load(Ordering::SeqCst), 1);
+        let local = router(backend, local_config());
+        assert_eq!(
+            local
+                .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_handshakes_require_the_key_for_both_audio_modes() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{Error as WsError, client::IntoClientRequest},
+        };
+
+        for (path, mode) in [
+            ("/v1/audio/transcriptions/stream", "transcribe"),
+            (
+                "/v1/audio/translations/stream?target_language=en",
+                "translate",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = router(Arc::new(FakeBackend::default()), keyed_config());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("ws://{address}{path}");
+            for key in [None, Some("Bearer incorrect-key")] {
+                let mut request = url.as_str().into_client_request().unwrap();
+                if let Some(key) = key {
+                    request
+                        .headers_mut()
+                        .insert(header::AUTHORIZATION, HeaderValue::from_static(key));
+                }
+                let WsError::Http(response) = connect_async(request).await.unwrap_err() else {
+                    panic!("expected authentication rejection before WebSocket upgrade")
+                };
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+            }
+            let mut request = url.as_str().into_client_request().unwrap();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer test-request-secret"),
+            );
+            let (mut socket, response) = connect_async(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            let message = timeout(Duration::from_secs(3), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let ready: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(ready["type"], "ready");
+            assert_eq!(ready["mode"], mode);
+            let client = reqwest::Client::new();
+            let upload = format!("http://{address}/v1/audio/transcriptions");
+            assert_eq!(
+                client.post(&upload).send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                client
+                    .post(&upload)
+                    .bearer_auth("test-request-secret")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            let _ = socket.close(None).await;
+            server.abort();
+        }
     }
 
     fn multipart(audio: &[u8], fields: &[(&str, &str)]) -> Request<Body> {
@@ -442,7 +701,7 @@ mod tests {
             translation_fails: true,
             ..Default::default()
         });
-        let app = router(backend.clone(), Config::parse_from(["streamtrans"]));
+        let app = router(backend.clone(), local_config());
         let response = app
             .clone()
             .oneshot(transcription(&wav(), &[]))
@@ -563,7 +822,7 @@ mod tests {
             .route("/v1/audio/transcriptions", post(transcribe_audio))
             .with_state(AppState {
                 backend: backend.clone(),
-                config: Config::parse_from(["streamtrans"]),
+                config: local_config(),
                 gate: gate.clone(),
             });
         let request = tokio::spawn(
@@ -622,7 +881,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let config = Config {
             max_audio_seconds: 1,
-            ..Config::parse_from(["streamtrans"])
+            ..local_config()
         };
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("long.wav");

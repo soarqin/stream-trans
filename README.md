@@ -63,7 +63,28 @@ powershell -ExecutionPolicy Bypass -File scripts/dist.ps1
 
 `--model-source` 统一选择 ASR、VAD 和翻译模型的下载源，接受 `huggingface`（默认）或 `modelscope`；连接失败时不会自动改用另一来源。已有 ModelScope 缓存可使用 `--model-source modelscope` 继续复用。两个来源的仓库、固定 revision 和缓存清单分别管理，默认 Hugging Face 不会误用旧 ModelScope 清单。`--asr-revision`、`--vad-revision` 和 `--llm-revision` 可覆盖当前下载源的相应固定版本。
 
-全部参数见 `.\target\release\streamtrans.exe --help`。开发模式默认缓存目录为当前工作目录下的 `models`；检测到发行布局时，默认缓存目录为可执行文件旁的 `models`，可用 `--cache-dir` 覆盖。模型清单按来源和模型规格独立生成，切换来源或模型版本时保留原有缓存。默认接口地址为 `127.0.0.1:3000`，跨机器调用需要自行配置带认证的反向代理。
+全部参数见 `.\target\release\streamtrans.exe --help`。开发模式默认缓存目录为当前工作目录下的 `models`；检测到发行布局时，默认缓存目录为可执行文件旁的 `models`，可用 `--cache-dir` 覆盖。模型清单按来源和模型规格独立生成，切换来源或模型版本时保留原有缓存。默认接口地址为 `127.0.0.1:3000`；设置请求 key 后，可显式绑定非回环地址供其他机器访问。
+
+### 请求 key 与跨机器访问
+
+服务端可通过 `--request-key` 或环境变量 `STREAMTRANS_REQUEST_KEY` 设置请求 key。未设置时，仅允许绑定回环地址；设置后，可用 `--bind 0.0.0.0:3000` 或 `--bind [::]:3000` 监听非回环地址。设置 key 不会自动修改默认监听地址。
+
+```powershell
+$env:STREAMTRANS_REQUEST_KEY = 'your-key'
+.\target\release\streamtrans.exe --bind 0.0.0.0:3000
+
+# 也可直接指定参数
+.\target\release\streamtrans.exe --bind 0.0.0.0:3000 --request-key your-key
+```
+
+请求 key 必须为 1–256 个可见 ASCII 字符，不能包含空白或为空。设置后，所有 HTTP 请求（含 `GET /health`）及两条 WebSocket 握手都必须携带单个 `Authorization: Bearer <key>` 请求头，本机调用也不例外。不支持将 key 放入 URL 查询参数；缺失、错误或重复认证头返回 `401 unauthorized`，并带有 `WWW-Authenticate: Bearer`。
+
+```powershell
+curl.exe http://127.0.0.1:3000/health -H "Authorization: Bearer $env:STREAMTRANS_REQUEST_KEY"
+curl.exe http://127.0.0.1:3000/v1/audio/translations -H "Authorization: Bearer $env:STREAMTRANS_REQUEST_KEY" -F "audio=@sample.wav" -F "target_language=en"
+```
+
+桌面客户端填写同一请求 key，或使用客户端的 `--request-key` / `STREAMTRANS_REQUEST_KEY`。请求 key 用于认证，不提供传输加密；跨不可信网络时通过 HTTPS/WSS 反向代理保护传输。
 
 ## Linux 安装与启动
 
@@ -94,9 +115,9 @@ powershell -ExecutionPolicy Bypass -File scripts/dist-client.ps1
 .\dist\StreamTransClient\streamtrans-client.exe
 ```
 
-GUI 中填写 API 地址（默认 `http://127.0.0.1:3000`），选择设备和语言后，点击「开始语音识别」或「开始自动翻译」。点击「停止录音」后等待末段处理完成。勾选「显示原文」「显示译文」会同步到客户端本机网页输出，默认地址为 `http://127.0.0.1:3001/`，可用于浏览器或 OBS 浏览器源。
+GUI 中填写 API 地址（默认 `http://127.0.0.1:3000`）；服务端设置了请求 key 时，填写同一「请求 key」。选择设备和语言后，点击「开始语音识别」或「开始自动翻译」。点击「停止录音」后等待末段处理完成。勾选「显示原文」「显示译文」会同步到客户端本机网页输出，默认地址为 `http://127.0.0.1:3001/`，可用于浏览器或 OBS 浏览器源。
 
-网页每 500 ms 刷新状态，样式从可执行文件旁的 `output.css` 读取，保存修改后自动生效；已有 CSS 不会被模板覆盖。中文 GUI 字体嵌入可执行文件，字体许可证随客户端分发。构建、打包、网页路径和 CSS 说明见 [客户端说明](docs/client.md)。跨机器连接需使用已有的认证反向代理或安全端口转发，服务端当前仅监听回环地址。
+网页每 500 ms 刷新状态，样式从可执行文件旁的 `output.css` 读取，保存修改后自动生效；已有 CSS 不会被模板覆盖。中文 GUI 字体嵌入可执行文件，字体许可证随客户端分发。构建、打包、网页路径和 CSS 说明见 [客户端说明](docs/client.md)。服务端可按上述请求 key 配置允许跨机器连接；客户端网页输出仍仅监听本机回环地址。
 
 网页地址添加 `?mode=latest` 可只显示最后一个语音段，内容最后更新 5 秒后自动隐藏；例如 `http://127.0.0.1:3001/?mode=latest&timeout=8` 将保留时间设为 8 秒。此模式只影响网页显示，桌面历史保留。
 
@@ -167,6 +188,7 @@ curl http://127.0.0.1:3000/v1/audio/translations \
 | HTTP 状态 | 错误码 | 处理方式 |
 | --- | --- | --- |
 | `400` | `invalid_request` | 补全字段、删除重复字段或修正参数 |
+| `401` | `unauthorized` | 设置正确的单个 `Authorization: Bearer <key>` 请求头 |
 | `413` | `audio_too_large` | 将文件缩小至 32 MiB 以内 |
 | `422` | `invalid_audio`、`empty_audio`、`audio_too_long`、`audio_decode_timeout` | 更换有效音频、缩短音频或重新编码 |
 | `429` | `busy` | 当前正在处理音频，稍后重试 |

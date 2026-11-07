@@ -5,8 +5,11 @@
 .\scripts\test-stream.ps1 -Wav .\audio.wav -AssertBeforeFinish -OutputPath .\stream.jsonl
 .EXAMPLE
 .\scripts\test-stream.ps1 -Wav .\audio.mp3 -Ffmpeg .\runtime\ffmpeg\ffmpeg.exe -SendAsFastAsPossible
+.EXAMPLE
+.\scripts\test-stream.ps1 -Wav .\audio.wav -RequestKey your-key
 .NOTES
 默认按真实时长发送 100 ms 音频块。快速发送可能触发服务端 audio_buffer_full，适合验证 finish。
+请求 key 默认从 STREAMTRANS_REQUEST_KEY 读取，以 Bearer 握手头发送，不放入 URL 或输出记录。
 每行输出 elapsedMs、sentAudioMs、finishSent 和完整 event。finishSent 从开始发送 finish 时置真，
 因此 AssertBeforeFinish 保守地要求首个 transcript 和 translation 都在此之前被接收。
 #>
@@ -14,6 +17,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Wav,
     [uri]$Uri = 'ws://127.0.0.1:3000/v1/audio/translations/stream?source_language=auto&target_language=en',
+    [AllowEmptyString()][string]$RequestKey = $env:STREAMTRANS_REQUEST_KEY,
     [string]$Ffmpeg,
     [ValidateRange(1, 1000)][int]$ChunkMs = 100,
     [bool]$Realtime = $true,
@@ -25,6 +29,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$hasRequestKey = $PSBoundParameters.ContainsKey('RequestKey') -or $null -ne $env:STREAMTRANS_REQUEST_KEY
+if ($hasRequestKey -and $RequestKey -notmatch '\A[\x21-\x7E]{1,256}\z') { throw '请求 key 必须为 1–256 个可见 ASCII 字符，不能包含空白。' }
 if ($Uri.Scheme -notin @('ws','wss')) { throw '-Uri 必须使用 ws:// 或 wss://。' }
 if (-not (Test-Path -LiteralPath $Wav -PathType Leaf)) { throw "找不到输入音频：$Wav。请通过 -Wav 指定文件。" }
 
@@ -154,6 +160,7 @@ try {
     }
     $probe = New-Object StreamTransWsProbe
     $socket = New-Object Net.WebSockets.ClientWebSocket
+    if ($hasRequestKey) { $socket.Options.SetRequestHeader('Authorization', 'Bearer ' + $RequestKey) }
     $cancellation = New-Object Threading.CancellationTokenSource
     $cancellation.CancelAfter($TimeoutSeconds * 1000)
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -180,6 +187,13 @@ try {
             $message.SetLength(0)
             $event = $raw | ConvertFrom-Json
             if (-not $event.PSObject.Properties['type']) { throw '服务事件缺少 type 字段，请检查接口协议。' }
+            if ($hasRequestKey -and $event.type -eq 'error') {
+                foreach ($field in @('message', 'error')) {
+                    $property = $event.PSObject.Properties[$field]
+                    if ($property -and $property.Value -is [string]) { $property.Value = $property.Value.Replace($RequestKey, '[redacted]') }
+                }
+                $raw = $event | ConvertTo-Json -Depth 20 -Compress
+            }
             $finishSent = $probe.FinishSent
             $record = [ordered]@{ elapsedMs = $clock.ElapsedMilliseconds; sentAudioMs = $probe.SentBytes / 32.0; finishSent = $finishSent; event = $event }
             $line = $record | ConvertTo-Json -Depth 20 -Compress
@@ -213,7 +227,9 @@ try {
         throw '提前返回验证失败：首个 transcript 和 translation 必须都在发送 finish 之前到达。请使用包含句间停顿且足够长的音频，并保持实时发送。'
     }
 } catch {
-    throw "流式测试失败：$($_.Exception.GetBaseException().Message)"
+    $failure = $_.Exception.GetBaseException().Message
+    if ($hasRequestKey) { $failure = $failure.Replace($RequestKey, '[redacted]') }
+    throw "流式测试失败：$failure"
 } finally {
     if ($cancellation) { $cancellation.Cancel() }
     if ($socket) {

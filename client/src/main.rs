@@ -19,6 +19,9 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:3000")]
     api: String,
+    /// 与服务端一致的可选请求 key；也可通过 STREAMTRANS_REQUEST_KEY 设置。
+    #[arg(long, env = "STREAMTRANS_REQUEST_KEY", hide_env_values = true)]
+    request_key: Option<String>,
     #[arg(long, default_value = "127.0.0.1:3001")]
     web_bind: SocketAddr,
     #[arg(long)]
@@ -73,6 +76,7 @@ fn run() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&audio::list_devices()?)?);
         return Ok(());
     }
+    network::validate_request_key(args.request_key.as_deref())?;
     ensure!(
         args.web_bind.ip().is_loopback(),
         "网页输出仅允许绑定本机回环地址"
@@ -113,6 +117,7 @@ fn run() -> Result<()> {
             Some(Session::start(
                 SessionOptions {
                     api: args.api,
+                    request_key: args.request_key,
                     device_id: "default".into(),
                     target,
                     wav: Some(wav),
@@ -162,6 +167,7 @@ fn run() -> Result<()> {
                 cc.egui_ctx.set_fonts(fonts);
                 Ok(Box::new(ClientApp::new(
                     args.api,
+                    args.request_key,
                     args.target,
                     web_address,
                     css,
@@ -191,6 +197,7 @@ const LANGUAGES: &[(&str, &str)] = &[
 
 struct ClientApp {
     api: String,
+    request_key: String,
     devices: Vec<audio::DeviceInfo>,
     device: String,
     target: String,
@@ -204,9 +211,17 @@ struct ClientApp {
 }
 
 impl ClientApp {
-    fn new(api: String, target: String, web: SocketAddr, css: PathBuf, store: OutputStore) -> Self {
+    fn new(
+        api: String,
+        request_key: Option<String>,
+        target: String,
+        web: SocketAddr,
+        css: PathBuf,
+        store: OutputStore,
+    ) -> Self {
         let mut app = Self {
             api,
+            request_key: request_key.unwrap_or_default(),
             devices: Vec::new(),
             device: "default".into(),
             target,
@@ -249,6 +264,7 @@ impl ClientApp {
         match Session::start(
             SessionOptions {
                 api: self.api.clone(),
+                request_key: (!self.request_key.is_empty()).then(|| self.request_key.clone()),
                 device_id: self.device.clone(),
                 target,
                 wav: None,
@@ -279,6 +295,13 @@ impl eframe::App for ClientApp {
                     egui::TextEdit::singleline(&mut self.api)
                         .desired_width(f32::INFINITY)
                         .hint_text("http://127.0.0.1:3000"),
+                );
+                ui.label("请求 key（可选）");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.request_key)
+                        .password(true)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("与服务端配置一致；未设置时留空"),
                 );
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {

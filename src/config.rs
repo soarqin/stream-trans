@@ -22,11 +22,14 @@ impl fmt::Display for ModelSource {
     }
 }
 
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Parser)]
 #[command(version, about = "本地 GPU 语音识别与翻译服务")]
 pub struct Config {
     #[arg(long, default_value = "127.0.0.1:3000")]
     pub bind: SocketAddr,
+    /// 可选请求 key；设置后所有请求须携带 Authorization: Bearer <key>。
+    #[arg(long, env = "STREAMTRANS_REQUEST_KEY", hide_env_values = true)]
+    pub request_key: Option<String>,
     #[arg(long, default_value_os_t = default_cache_dir())]
     pub cache_dir: PathBuf,
     #[arg(long, default_value_os_t = default_asr_library())]
@@ -76,13 +79,19 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        if let Some(key) = &self.request_key {
+            ensure!(
+                !key.is_empty() && key.len() <= 256 && key.bytes().all(|b| b.is_ascii_graphic()),
+                "请求 key 必须为 1–256 个可见 ASCII 字符，不能包含空白"
+            );
+        }
         ensure!(
             self.max_tokens + 1024 < self.context_size,
             "context-size 必须大于 max-tokens + 1024，为输入文本保留空间"
         );
         ensure!(
-            self.bind.ip().is_loopback(),
-            "此版本仅允许绑定回环地址；跨机器访问请通过带认证的反向代理"
+            self.bind.ip().is_loopback() || self.request_key.is_some(),
+            "未设置请求 key 时仅允许绑定回环地址；非回环监听须设置 --request-key 或 STREAMTRANS_REQUEST_KEY"
         );
         Ok(())
     }
@@ -151,6 +160,46 @@ fn default_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_loopback_binding_requires_a_valid_request_key() {
+        let explicit =
+            Config::try_parse_from(["streamtrans", "--request-key", "test-request-key"]).unwrap();
+        assert!(explicit.bind.ip().is_loopback());
+        assert_eq!(explicit.request_key.as_deref(), Some("test-request-key"));
+        assert!(explicit.validate().is_ok());
+
+        let mut config = Config::try_parse_from(["streamtrans"]).unwrap();
+        config.request_key = None;
+        for bind in ["127.0.0.1:3000", "[::1]:3000"] {
+            config.bind = bind.parse().unwrap();
+            assert!(config.validate().is_ok());
+        }
+        for bind in ["0.0.0.0:3000", "192.168.1.10:3000", "[::]:3000"] {
+            config.bind = bind.parse().unwrap();
+            config.request_key = None;
+            assert!(config.validate().is_err());
+            config.request_key = Some("test-request-key".into());
+            assert!(config.validate().is_ok());
+        }
+        for key in [
+            "",
+            " ",
+            " leading",
+            "trailing ",
+            "new\nline",
+            "tab\tkey",
+            "中文",
+        ] {
+            config.request_key = Some(key.into());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("ASCII"));
+        }
+        config.request_key = Some("x".repeat(257));
+        assert!(config.validate().is_err());
+        config.request_key = Some("x".repeat(256));
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn hy_mt_defaults_preserve_translation_output_budget() {

@@ -5,6 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tempfile::NamedTempFile;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::{sleep, timeout},
 };
@@ -56,6 +57,7 @@ async fn listener() -> (TcpListener, String) {
 fn options(api: String, target: Option<&str>, wav: &NamedTempFile) -> SessionOptions {
     SessionOptions {
         api,
+        request_key: None,
         target: target.map(str::to_owned),
         wav: Some(wav.path().to_path_buf()),
         // If the WAV branch accidentally opens a microphone, startup must fail.
@@ -66,8 +68,26 @@ fn options(api: String, target: Option<&str>, wav: &NamedTempFile) -> SessionOpt
 // Tungstenite fixes the handshake callback's error type to an unboxed HTTP response.
 #[allow(clippy::result_large_err)]
 async fn accept(listener: TcpListener, target: Option<&'static str>) -> Socket {
+    accept_with_key(listener, target, None).await
+}
+
+// Tungstenite fixes the handshake callback's error type to an unboxed HTTP response.
+#[allow(clippy::result_large_err)]
+async fn accept_with_key(
+    listener: TcpListener,
+    target: Option<&'static str>,
+    key: Option<&'static str>,
+) -> Socket {
     let (stream, _) = timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
     accept_hdr_async(stream, move |request: &Request, response: Response| {
+        let authorization = request.headers().get("authorization");
+        if let Some(key) = key {
+            assert_eq!(authorization.unwrap(), format!("Bearer {key}").as_str());
+            assert_eq!(request.headers().get_all("authorization").iter().count(), 1);
+            assert!(!request.uri().to_string().contains(key));
+        } else {
+            assert!(authorization.is_none());
+        }
         let url = url::Url::parse(&format!("ws://localhost{}", request.uri())).unwrap();
         let route = if target.is_some() {
             "translations"
@@ -140,13 +160,13 @@ async fn completed(session: &Session) {
     .expect("session thread did not terminate");
 }
 
-async fn successful_session(target: Option<&'static str>) {
+async fn successful_session(target: Option<&'static str>, key: Option<&'static str>) {
     let (wav, expected) = synthetic_wav(3697);
     let (listener, api) = listener().await;
     let store = OutputStore::new();
     let observed_store = store.clone();
     let server = tokio::spawn(async move {
-        let mut socket = accept(listener, target).await;
+        let mut socket = accept_with_key(listener, target, key).await;
         send(
             &mut socket,
             json!({"type":"ready","mode":if target.is_some() {"translate"} else {"transcribe"}}),
@@ -202,10 +222,15 @@ async fn successful_session(target: Option<&'static str>) {
         .await;
         let _ = socket.close(None).await;
     });
-    let session = Session::start(options(api, target, &wav), store.clone()).unwrap();
+    let mut options = options(api, target, &wav);
+    options.request_key = key.map(str::to_owned);
+    let session = Session::start(options, store.clone()).unwrap();
     timeout(LIMIT, server).await.unwrap().unwrap();
     completed(&session).await;
     let snapshot = store.snapshot();
+    if let Some(key) = key {
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains(key));
+    }
     assert_eq!(snapshot.status, "已完成");
     assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
     assert_eq!(
@@ -235,12 +260,74 @@ async fn successful_session(target: Option<&'static str>) {
 
 #[tokio::test]
 async fn asr_only_replay_uses_transcription_route_without_target() {
-    successful_session(None).await;
+    successful_session(None, None).await;
 }
 
 #[tokio::test]
 async fn translation_replay_updates_one_row_and_finishes_after_all_pcm() {
-    successful_session(Some("ja")).await;
+    successful_session(Some("ja"), None).await;
+}
+
+#[tokio::test]
+async fn request_key_authenticates_both_replay_modes_without_entering_output_state() {
+    successful_session(None, Some("synthetic-client-key")).await;
+    successful_session(Some("ja"), Some("synthetic-client-key")).await;
+}
+
+#[tokio::test]
+async fn rejected_key_does_not_send_audio_or_echo_server_response_secrets() {
+    const KEY: &str = "synthetic-rejected-client-key";
+    let (wav, _) = synthetic_wav(16_000);
+    let (listener, api) = listener().await;
+    let store = OutputStore::new();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            timeout(LIMIT, stream.read_exact(&mut byte))
+                .await
+                .unwrap()
+                .unwrap();
+            request.push(byte[0]);
+            assert!(request.len() < 8192);
+        }
+        let request = String::from_utf8(request).unwrap();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {KEY}"))
+        );
+        assert!(!request.lines().next().unwrap().contains(KEY));
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nX-Echo-Key: {KEY}\r\nConnection: close\r\n\r\n{KEY}",
+            KEY.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        let mut bytes = [0; 64];
+        let trailing = timeout(LIMIT, stream.read(&mut bytes)).await.unwrap();
+        assert!(
+            matches!(trailing, Ok(0))
+                || trailing.as_ref().is_err_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    )
+                }),
+            "unauthorized connection must close without sending audio"
+        );
+    });
+    let mut options = options(api, None, &wav);
+    options.request_key = Some(KEY.to_owned());
+    let session = Session::start(options, store.clone()).unwrap();
+    completed(&session).await;
+    timeout(LIMIT, server).await.unwrap().unwrap();
+    let snapshot = store.snapshot();
+    let error = snapshot.error.as_deref().unwrap();
+    assert!(error.contains("HTTP 401"));
+    assert!(!error.contains(KEY));
+    assert!(!serde_json::to_string(&snapshot).unwrap().contains(KEY));
+    assert!(snapshot.rows.is_empty());
 }
 
 #[tokio::test]

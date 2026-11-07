@@ -6,13 +6,20 @@ use tokio::{
     sync::{mpsc as async_mpsc, watch},
     time::{Instant, timeout},
 };
-use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
+use tokio_tungstenite::tungstenite::{
+    Message,
+    client::IntoClientRequest,
+    handshake::client::Request,
+    http::{HeaderValue, header},
+    protocol::WebSocketConfig,
+};
 use url::Url;
 
 use crate::{audio::Capture, output::OutputStore};
 
 pub struct SessionOptions {
     pub api: String,
+    pub request_key: Option<String>,
     pub device_id: String,
     pub target: Option<String>,
     pub wav: Option<PathBuf>,
@@ -25,6 +32,7 @@ pub struct Session {
 
 impl Session {
     pub fn start(options: SessionOptions, store: OutputStore) -> Result<Self> {
+        validate_request_key(options.request_key.as_deref())?;
         let url = stream_url(&options.api, options.target.as_deref())?;
         let (stop, receiver) = watch::channel(false);
         store.set_error(None);
@@ -37,6 +45,7 @@ impl Session {
         let thread = thread::Builder::new()
             .name("streamtrans-session".into())
             .spawn(move || {
+                let request_key = options.request_key.clone();
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -46,7 +55,11 @@ impl Session {
                     });
                 if let Err(error) = result {
                     store.set_status("已停止：发生错误");
-                    store.set_error(Some(format!("{error:#}")));
+                    let mut message = format!("{error:#}");
+                    if let Some(key) = request_key {
+                        message = message.replace(&key, "[redacted]");
+                    }
+                    store.set_error(Some(message));
                 }
             })
             .context("无法创建连接线程")?;
@@ -64,6 +77,31 @@ impl Session {
             .as_ref()
             .is_none_or(|thread| thread.is_finished())
     }
+}
+
+pub fn validate_request_key(key: Option<&str>) -> Result<()> {
+    ensure!(
+        key.is_none_or(|key| {
+            !key.is_empty() && key.len() <= 256 && key.bytes().all(|byte| byte.is_ascii_graphic())
+        }),
+        "请求 key 必须为 1–256 个可见 ASCII 字符，不能包含空白"
+    );
+    Ok(())
+}
+
+fn stream_request(url: &Url, key: Option<&str>) -> Result<Request> {
+    validate_request_key(key)?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| anyhow::anyhow!("无法创建 WebSocket 请求"))?;
+    if let Some(key) = key {
+        let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| anyhow::anyhow!("请求 key 格式无效"))?;
+        value.set_sensitive(true);
+        request.headers_mut().insert(header::AUTHORIZATION, value);
+    }
+    Ok(request)
 }
 
 impl Drop for Session {
@@ -130,13 +168,25 @@ async fn run(
     store: OutputStore,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
+    let request = stream_request(&url, options.request_key.as_deref())?;
     let config = WebSocketConfig::default()
         .read_buffer_size(16 * 1024)
         .max_message_size(Some(2 * 1024 * 1024))
         .max_frame_size(Some(2 * 1024 * 1024));
     let connection = tokio::select! {
-        result = timeout(Duration::from_secs(10), tokio_tungstenite::connect_async_with_config(url.as_str(), Some(config), true)) => {
-            result.context("连接服务超时，请检查 API 地址与服务状态")?.context("无法连接服务")?
+        result = timeout(Duration::from_secs(10), tokio_tungstenite::connect_async_with_config(request, Some(config), true)) => {
+            result.context("连接服务超时，请检查 API 地址与服务状态")?.map_err(|error| {
+                // HTTP errors may contain an echoed request header or response body.
+                match error {
+                    tokio_tungstenite::tungstenite::Error::Http(response) if response.status().as_u16() == 401 => {
+                        anyhow::anyhow!("服务认证失败（HTTP 401），请检查请求 key")
+                    }
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        anyhow::anyhow!("无法连接服务：HTTP {}", response.status().as_u16())
+                    }
+                    _ => anyhow::anyhow!("无法连接服务，请检查 API 地址、网络与服务状态"),
+                }
+            })?
         }
         _ = stop.changed() => { store.set_status("已停止"); return Ok(()); }
     };
@@ -316,5 +366,38 @@ mod tests {
         ] {
             assert!(stream_url(api, None).is_err(), "{api}");
         }
+    }
+
+    #[test]
+    fn request_keys_are_validated_without_echo_and_sent_only_in_sensitive_headers() {
+        let url = stream_url("https://example.org", None).unwrap();
+        let request = stream_request(&url, Some("literal-Key_123")).unwrap();
+        let authorization = &request.headers()[header::AUTHORIZATION];
+        assert_eq!(authorization, "Bearer literal-Key_123");
+        assert!(authorization.is_sensitive());
+        assert!(!request.uri().to_string().contains("literal-Key_123"));
+        assert!(
+            !stream_request(&url, None)
+                .unwrap()
+                .headers()
+                .contains_key(header::AUTHORIZATION)
+        );
+        for invalid in [
+            String::new(),
+            " secret".into(),
+            "secret ".into(),
+            "line\r\nbreak".into(),
+            "中文".into(),
+            "x".repeat(257),
+        ] {
+            let error = stream_request(&url, Some(&invalid))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("请求 key"));
+            if !invalid.is_empty() {
+                assert!(!error.contains(&invalid));
+            }
+        }
+        assert!(validate_request_key(Some(&"x".repeat(256))).is_ok());
     }
 }
