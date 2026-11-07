@@ -12,7 +12,7 @@
 
 **最终翻译模型选型（2026-11-03）：Hy-MT2-1.8B GGUF Q6_K。** 经过 12 个量化版本的中日韩英翻译对比，确认保留该模型作为生产默认。固定版本、选型依据和已知限制见 [模型说明](docs/models.md#翻译模型最终选型)。
 
-ASR 和 LLM 必须运行在 GPU 上，不自动回退 CPU。Windows 分发包包含 ASR 原生库、llama.cpp、CUDA 运行库和 FFmpeg；运行机器仍需兼容的 NVIDIA 驱动。项目不内置模型权重，首次启动自动从 **ModelScope** 下载三个固定版本，使用 Rust 转换 ASR 缓存，后续复用并支持离线启动。来源、精度与限制见 [模型说明](docs/models.md)，打包与部署见 [分发说明](docs/distribution.md)。
+ASR 和 LLM 必须运行在 GPU 上，不自动回退 CPU。Windows 分发包包含 ASR 原生库、llama.cpp、CUDA 运行库和 FFmpeg；运行机器仍需兼容的 NVIDIA 驱动。项目不内置模型权重，首次启动默认从 **Hugging Face** 下载三个固定版本，也可通过 `--model-source modelscope` 选择 **ModelScope**。模型由 Rust 下载、校验并转换 ASR 缓存，后续复用并支持离线启动。来源、精度与限制见 [模型说明](docs/models.md)，打包与部署见 [分发说明](docs/distribution.md)。
 
 ## Windows 安装与启动
 
@@ -55,9 +55,15 @@ powershell -ExecutionPolicy Bypass -File scripts/dist.ps1
 
 ```powershell
 .\target\release\streamtrans.exe --download-only
+
+# 显式选择下载源；同样适用于正常启动
+.\target\release\streamtrans.exe --model-source huggingface --download-only
+.\target\release\streamtrans.exe --model-source modelscope --download-only
 ```
 
-全部参数见 `.\target\release\streamtrans.exe --help`。开发模式默认缓存目录为当前工作目录下的 `models`；检测到发行布局时，默认缓存目录为可执行文件旁的 `models`，可用 `--cache-dir` 覆盖。模型清单按模型规格独立生成，更新到 Hy-MT2 时保留旧模型和旧清单，仍需首次下载新的 Q6_K 文件。默认接口地址为 `127.0.0.1:3000`，跨机器调用需要自行配置带认证的反向代理。
+`--model-source` 统一选择 ASR、VAD 和翻译模型的下载源，接受 `huggingface`（默认）或 `modelscope`；连接失败时不会自动改用另一来源。已有 ModelScope 缓存可使用 `--model-source modelscope` 继续复用。两个来源的仓库、固定 revision 和缓存清单分别管理，默认 Hugging Face 不会误用旧 ModelScope 清单。`--asr-revision`、`--vad-revision` 和 `--llm-revision` 可覆盖当前下载源的相应固定版本。
+
+全部参数见 `.\target\release\streamtrans.exe --help`。开发模式默认缓存目录为当前工作目录下的 `models`；检测到发行布局时，默认缓存目录为可执行文件旁的 `models`，可用 `--cache-dir` 覆盖。模型清单按来源和模型规格独立生成，切换来源或模型版本时保留原有缓存。默认接口地址为 `127.0.0.1:3000`，跨机器调用需要自行配置带认证的反向代理。
 
 ## Linux 安装与启动
 

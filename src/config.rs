@@ -1,7 +1,26 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{fmt, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelSource {
+    #[value(name = "huggingface")]
+    HuggingFace,
+    #[value(name = "modelscope")]
+    ModelScope,
+}
+
+impl fmt::Display for ModelSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::HuggingFace => "Hugging Face",
+            Self::ModelScope => "ModelScope",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "本地 GPU 语音识别与翻译服务")]
@@ -38,12 +57,18 @@ pub struct Config {
     pub inference_timeout_seconds: u64,
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     pub startup_timeout_seconds: u64,
-    #[arg(long, default_value = "05201c46f1c38592b1567f857c0d56eab3d0d8ef")]
-    pub asr_revision: String,
-    #[arg(long, default_value = "e97e6af0ec0950385644d7c0a8e5c899071f722b")]
-    pub llm_revision: String,
-    #[arg(long, default_value = "f9a8b8274674755d925277e27063869038d41515")]
-    pub vad_revision: String,
+    /// 模型下载源，统一用于 ASR、VAD 和翻译模型。
+    #[arg(long, value_enum, default_value = "huggingface")]
+    pub model_source: ModelSource,
+    /// 覆盖当前下载源的 ASR revision；省略时使用该源的固定版本。
+    #[arg(long)]
+    pub asr_revision: Option<String>,
+    /// 覆盖当前下载源的翻译模型 revision；省略时使用该源的固定版本。
+    #[arg(long)]
+    pub llm_revision: Option<String>,
+    /// 覆盖当前下载源的 VAD revision；省略时使用该源的固定版本。
+    #[arg(long)]
+    pub vad_revision: Option<String>,
     /// 仅下载模型，不加载 GPU 或启动 HTTP 服务。
     #[arg(long)]
     pub download_only: bool,
@@ -132,10 +157,33 @@ mod tests {
         let config = Config::try_parse_from(["streamtrans"]).unwrap();
         assert_eq!(config.context_size, 4096);
         assert_eq!(config.max_tokens, 2048);
-        assert_eq!(
-            config.llm_revision,
-            "e97e6af0ec0950385644d7c0a8e5c899071f722b"
-        );
+        assert_eq!(config.model_source, ModelSource::HuggingFace);
+        assert!(config.llm_revision.is_none());
         assert!(Config::try_parse_from(["streamtrans", "--llm-thinking"]).is_err());
+    }
+
+    #[test]
+    fn download_source_and_revision_overrides_are_explicit() {
+        let config = Config::try_parse_from([
+            "streamtrans",
+            "--model-source",
+            "modelscope",
+            "--llm-revision",
+            "custom-revision",
+            "--download-only",
+        ])
+        .unwrap();
+        assert_eq!(config.model_source, ModelSource::ModelScope);
+        assert_eq!(config.llm_revision.as_deref(), Some("custom-revision"));
+        assert!(config.download_only);
+        assert!(Config::try_parse_from(["streamtrans", "--model-source", "unknown"]).is_err());
+        assert_eq!(
+            serde_json::to_string(&ModelSource::HuggingFace).unwrap(),
+            "\"huggingface\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelSource::ModelScope).unwrap(),
+            "\"modelscope\""
+        );
     }
 }

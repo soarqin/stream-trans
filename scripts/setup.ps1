@@ -96,4 +96,4 @@ New-Item -ItemType Directory -Path $msvcLicenses -Force | Out-Null
 $msvcLicense = Get-VerifiedAsset 'Visual-C-Runtime-2015-2022-License.docx' 'https://visualstudio.microsoft.com/wp-content/uploads/2021/09/Visual-C-Runtime-2015-2022-License-1.docx' 'f1e3d56ceb2ad68aae0711b910375009e651ac5530fa0760f0dea6e81e54fae1'
 Copy-Item -LiteralPath $msvcLicense -Destination $msvcLicenses -Force
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'build.ps1') }
-Write-Host '运行库准备完成，不需要 Python 或 CUDA Toolkit。FFmpeg 请自行准备；运行 .\target\release\streamtrans.exe，或执行 .\scripts\dist.ps1 制作分发目录。首次启动会从 ModelScope 下载模型。'
+Write-Host '运行库准备完成，不需要 Python 或 CUDA Toolkit。FFmpeg 请自行准备；运行 .\target\release\streamtrans.exe，或执行 .\scripts\dist.ps1 制作分发目录。首次启动默认从 Hugging Face 下载模型；使用 --model-source modelscope 可选择 ModelScope。'

@@ -1,4 +1,4 @@
-//! Native conversion of the ModelScope checkpoint, without executing Python or pickle code.
+//! Native conversion of the official checkpoint, without executing Python or pickle code.
 //!
 //! Tensor names and metadata follow the MIT-licensed transcribe.cpp converter:
 //! https://github.com/handy-computer/transcribe.cpp/blob/v0.4.1/scripts/convert-funasr_nano.py
@@ -440,11 +440,11 @@ fn align(writer: &mut (impl Write + Seek)) -> Result<()> {
     Ok(())
 }
 
-/// Convert a verified ModelScope checkpoint to an atomically published GGUF cache file.
+/// Convert a verified official checkpoint to an atomically published GGUF cache file.
 pub fn convert(directory: &Path, output: &Path) -> Result<()> {
     let metadata = metadata(directory)?;
     let checkpoint = directory.join("model.pt");
-    // ModelScope revisions use either a flat state dict or a `state_dict` wrapper.
+    // Official checkpoints use either a flat state dict or a `state_dict` wrapper.
     let tensors = PthTensors::new(&checkpoint, Some("state_dict"))
         .or_else(|_| PthTensors::new(&checkpoint, None))
         .context("无法读取 Fun-ASR-Nano PyTorch 权重")?;
@@ -578,6 +578,37 @@ pub fn convert(directory: &Path, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the downloaded default Hugging Face checkpoint; no GPU needed"]
+    fn huggingface_checkpoint_matches_existing_native_bf16_weights() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "models/huggingface/models/FunAudioLLM--Fun-ASR-Nano-2512/snapshots/272c57b82523ada6fd87095e955f8e29100979ab",
+        );
+        let temporary = tempfile::tempdir()?;
+        let output = temporary.path().join("hf-native-bf16.gguf");
+        convert(&directory, &output)?;
+        let mut file = File::open(output)?;
+        assert_eq!(file.metadata()?.len(), 1_667_503_232);
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 2 * 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            "9410f344a3f51d4fd9797d4fc7ef36ea66575878eea6828485f1df247e5f7e7c",
+            "Hugging Face conversion must preserve the existing native BF16 weights and metadata"
+        );
+        Ok(())
+    }
 
     #[test]
     fn model_mapping_and_precision_are_complete() {

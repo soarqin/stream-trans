@@ -4,19 +4,51 @@ StreamTrans 使用 Rust 提供 HTTP 接口、下载模型、转换权重和调�
 
 ## 固定模型版本
 
+服务端通过 `--model-source huggingface|modelscope` 统一选择三个模型的下载源，默认是 `huggingface`。未显式指定 `--asr-revision`、`--vad-revision` 或 `--llm-revision` 时，使用对应来源的下列固定版本；显式指定时，仅覆盖当前来源的相应模型版本。连接失败时返回错误，不自动切换来源。
+
+### Hugging Face（默认）
+
+| 用途 | Hugging Face 仓库 | 固定 revision | 精度与执行方式 |
+| --- | --- | --- | --- |
+| 语音识别 | `FunAudioLLM/Fun-ASR-Nano-2512` | `272c57b82523ada6fd87095e955f8e29100979ab` | CUDA；二维矩阵权重 BF16，音频激活 FP32 |
+| 语音分段 | `funasr/fsmn-vad` | `df20e6b30c653645fa4ff125cacfcabd1020a669` | Rust Candle，CPU FP32 |
+| 文本翻译 | `tencent/Hy-MT2-1.8B-GGUF` | `a0c709d9fac510f2c807aa3af52872340dc37a4a` | llama.cpp CUDA，`Q6_K` |
+
+模型页面：[Fun-ASR-Nano-2512](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512)、[FSMN-VAD](https://huggingface.co/funasr/fsmn-vad)、[Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF)。
+
+### ModelScope
+
 | 用途 | ModelScope 仓库 | 固定 revision | 精度与执行方式 |
 | --- | --- | --- | --- |
 | 语音识别 | `FunAudioLLM/Fun-ASR-Nano-2512` | `05201c46f1c38592b1567f857c0d56eab3d0d8ef` | CUDA；二维矩阵权重 BF16，音频激活 FP32 |
 | 语音分段 | `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | `f9a8b8274674755d925277e27063869038d41515` | Rust Candle，CPU FP32 |
 | 文本翻译 | `Tencent-Hunyuan/Hy-MT2-1.8B-GGUF` | `e97e6af0ec0950385644d7c0a8e5c899071f722b` | llama.cpp CUDA，`Q6_K` |
 
-模型由 Rust 从 ModelScope 下载。开发模式默认使用当前工作目录下的 `models`，发行模式默认使用可执行文件旁的 `models`，可用 `--cache-dir` 修改。原始下载文件的列表、大小和 SHA256 来自 ModelScope 仓库 API，下载完成后校验；后续通过本地清单复用完整缓存，可以离线启动。清单按模型仓库、revision 和文件规格生成独立指纹，切换到 Hy-MT2 时保留旧模型和旧清单，新模型独立下载及校验。模型权重和生成的转换缓存不提交到 Git，也不放入分发包。
-
 模型页面：[Fun-ASR-Nano-2512](https://modelscope.cn/models/FunAudioLLM/Fun-ASR-Nano-2512)、[FSMN-VAD](https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch)、[Hy-MT2-1.8B-GGUF](https://modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF)。文件请求使用 [ModelScope 官方 SDK 定义的 HTTP 接口](https://github.com/modelscope/modelscope/blob/master/modelscope/hub/file_download.py)，项目不依赖该 Python SDK。
+
+### 下载、校验与缓存
+
+模型下载由 Rust HTTP 客户端完成，不依赖 Hugging Face 或 ModelScope 的 Python SDK。Hugging Face 使用固定 revision 的仓库 API：LFS 文件读取 SHA256 与大小，非 LFS 文件读取内容后计算 SHA256；不会将 Git blob 的 SHA1 当作文件 SHA256。ModelScope 使用仓库 API 提供的文件列表、大小和 SHA256。两种来源都在下载时检查完整长度和 SHA256，完成后原子保存；中断的部分文件不会作为有效模型使用。
+
+开发模式默认缓存根目录为当前工作目录下的 `models`，发行模式默认使用可执行文件旁的 `models`，可用 `--cache-dir` 修改。Hugging Face 文件位于 `<缓存根目录>/huggingface/models/<仓库>/snapshots/<revision>/`；ModelScope 沿用 `<缓存根目录>/models/<仓库>/snapshots/<revision>/`，其中仓库名的 `/` 转为 `--`。清单按来源、仓库、revision 和文件规格分别管理，不同来源不会误用彼此的清单。
+
+已有的无来源字段旧清单视为 ModelScope，使用 `--model-source modelscope` 可继续校验并离线复用。离线机器须保留整个缓存目录及清单，选择与下载时相同的来源和版本。切换来源不会删除旧缓存；需要为另一个来源的文件和 ASR 转换副本预留磁盘空间。模型权重和生成的转换缓存不提交到 Git，也不放入分发包。
+
+两个来源的 revision 不能互换；ASR 的 `model.pt` 打包文件并非逐字节相同，下载和转换均按所选来源独立校验与缓存。
+
+2026-11-07 已通过默认来源实际下载全部 15 个文件，并在不可联网的代理配置下分别验证 Hugging Face 和旧 ModelScope 缓存复用。Hugging Face ASR 检查点经现有 Rust 转换器生成的 BF16 GGUF 为 `1667503232` 字节，SHA256 为 `9410f344a3f51d4fd9797d4fc7ef36ea66575878eea6828485f1df247e5f7e7c`，与既有 ModelScope 转换缓存完全一致。该本地转换回归可用 `cargo test --release --locked --bin streamtrans huggingface_checkpoint_matches_existing_native_bf16_weights -- --ignored` 复现，需要默认 Hugging Face 检查点已下载到项目的 `models` 缓存，不需要 GPU。本轮服务端及基准工具通过 98 项常规测试，另行通过上述转换测试；未重复执行 GPU 推理测试。
+
+```powershell
+# 默认来源，也可显式写 --model-source huggingface
+.\target\release\streamtrans.exe --download-only
+
+# 选择 ModelScope；去掉 --download-only 可正常启动服务
+.\target\release\streamtrans.exe --model-source modelscope --download-only
+```
 
 ## 翻译模型最终选型
 
-2026-11-03，经用户确认，项目最终选用 **Hy-MT2-1.8B GGUF Q6_K**，继续通过 llama.cpp CUDA 运行。生产默认下载上述固定 revision 的 `Hy-MT2-1.8B-Q6_K.gguf`，保留现有翻译模板、推荐采样和完整术语表前缀缓存。
+2026-11-03，经用户确认，项目最终选用 **Hy-MT2-1.8B GGUF Q6_K**，继续通过 llama.cpp CUDA 运行。两个下载源均使用 `Hy-MT2-1.8B-Q6_K.gguf`，对应各自的固定 revision，保留现有翻译模板、推荐采样和完整术语表前缀缓存。
 
 选型依据是显存上限 3.5 GB 的 12 个量化版本实测，比较中日韩英翻译的事实保留、内容完整性、术语遵从与响应时间。其他候选未展示稳定的整体质量优势；Gemma4 QAT 虽然更快，仍有术语不遵从和整句遗漏。完整证据见 [模型对比报告](translation-model-comparison-20261103.md) 和 [离线逐句对照页](translation-model-comparison-20261103.html)。
 
@@ -43,7 +75,7 @@ ASR 原生库明确选择 CUDA 后端，服务检查实际模型后端，不自�
 
 ## Hy-MT2 量化推理与托管子进程
 
-项目使用固定版本的 [llama.cpp b11960](https://github.com/ggml-org/llama.cpp/releases/tag/b11960)，直接加载 ModelScope 官方的 `Hy-MT2-1.8B-Q6_K.gguf`，保留原始量化权重。所有模型层加载到 CUDA；llama.cpp 负责分词、模型计算和采样，Rust 负责请求调度与结果检查，不需要 Python 推理环境。
+项目使用固定版本的 [llama.cpp b11960](https://github.com/ggml-org/llama.cpp/releases/tag/b11960)，直接加载所选来源官方仓库中的 `Hy-MT2-1.8B-Q6_K.gguf`，保留原始量化权重。所有模型层加载到 CUDA；llama.cpp 负责分词、模型计算和采样，Rust 负责请求调度与结果检查，不需要 Python 推理环境。
 
 该文件大小为 `1474785120` 字节，SHA256 为：
 
@@ -51,7 +83,7 @@ ASR 原生库明确选择 CUDA 后端，服务检查实际模型后端，不自�
 d98fe604dec1f28f58f80d7d560f7177e584d3b8e5835862687660e5ff97cb40
 ```
 
-来源：[固定 revision 的 ModelScope 文件清单](https://modelscope.cn/api/v1/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/repo/files?Revision=e97e6af0ec0950385644d7c0a8e5c899071f722b&Recursive=true)。分词器与聊天控制标记使用 GGUF 内的数据。提示基于当前模型的官方翻译模板，追加逐句完整翻译、保留数字、单位、条件和否定关系的提醒；不是逐字使用官方示例，也不使用旧 MiniCPM5 的空思考前缀。该提醒不能保证所有事实都会正确保留，仍需检查实际译文。
+来源：[固定 revision 的 Hugging Face 文件清单](https://huggingface.co/api/models/tencent/Hy-MT2-1.8B-GGUF/revision/a0c709d9fac510f2c807aa3af52872340dc37a4a?blobs=true)、[固定 revision 的 ModelScope 文件清单](https://modelscope.cn/api/v1/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/repo/files?Revision=e97e6af0ec0950385644d7c0a8e5c899071f722b&Recursive=true)。两个来源的 Q6_K 文件大小与 SHA256 一致。分词器与聊天控制标记使用 GGUF 内的数据。提示基于当前模型的官方翻译模板，追加逐句完整翻译、保留数字、单位、条件和否定关系的提醒；不是逐字使用官方示例，也不使用旧 MiniCPM5 的空思考前缀。该提醒不能保证所有事实都会正确保留，仍需检查实际译文。
 
 生产默认使用官方 1.8B 推荐采样值 `temperature=0.7`、`top_p=0.6`、`top_k=20`、重复惩罚 `1.05`；项目固定 `seed=42`。`min_p=0.0`，presence 与 frequency 惩罚为 `0.0`。模型直接生成译文，不提供思考模式开关；没有译文、未返回正常结束标记或生成耗尽预算时返回错误。官方模板与参数见 [Hy-MT2-1.8B-GGUF 模型卡](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF#inference-and-deployment)。
 
@@ -67,7 +99,7 @@ d98fe604dec1f28f58f80d7d560f7177e584d3b8e5835862687660e5ff97cb40
 
 ## FSMN-VAD 分段
 
-VAD 使用 ModelScope 原始 FSMN 权重和 CMVN，按固定模型配置由 Rust 实现音频特征、FSMN 网络和语音边界状态机，使用 CPU FP32。断句不依赖 Python，也不占用大模型的 GPU 显存。
+VAD 使用所选来源的原始 FSMN 权重和 CMVN，按固定模型配置由 Rust 实现音频特征、FSMN 网络和语音边界状态机，使用 CPU FP32。断句不依赖 Python，也不占用大模型的 GPU 显存。
 
 VAD 检测语音活动边界，不保证每段都是完整语句。原生浮点计算与参考实现的边界可能有小幅差异，应根据实际音频评估；接口继续使用毫秒时间戳，单段上限为 15 秒。
 
@@ -78,7 +110,7 @@ VAD 检测语音活动边界，不保证每段都是完整语句。原生浮点�
 - Windows x64、Rust stable、Visual Studio 2022 C++ Build Tools，安装「使用 C++ 的桌面开发」组件。
 - 构建不需要 CUDA Toolkit 或 NVCC。
 - 运行需要支持原生 BF16 的 NVIDIA GPU，以及兼容随包 CUDA 运行库的 NVIDIA 驱动。
-- 首次安装可访问原生程序上游下载站点和 crates.io；首次模型下载可访问 ModelScope。
+- 首次安装可访问原生程序上游下载站点和 crates.io；首次模型下载可访问所选的 Hugging Face 或 ModelScope。
 
 安装命令：
 

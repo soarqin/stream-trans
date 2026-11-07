@@ -2,7 +2,7 @@
 
 分发目录包含 StreamTrans、ASR 原生库、llama.cpp、CUDA 运行库、FFmpeg 和第三方许可证，不包含模型权重、模型转换缓存、Python 环境或 CUDA 编译工具。运行机器需要 Windows x64、支持原生 BF16 的 NVIDIA GPU，以及兼容随包 CUDA 运行库的 NVIDIA 驱动。
 
-最终翻译模型选定为 **Hy-MT2-1.8B GGUF Q6_K**（2026-11-03），首次启动从 ModelScope 下载固定版本。模型文件、revision 与选型依据见 [模型说明](models.md#翻译模型最终选型)。
+最终翻译模型选定为 **Hy-MT2-1.8B GGUF Q6_K**（2026-11-03），首次启动默认从 Hugging Face 下载固定版本，也可通过 `--model-source modelscope` 使用 ModelScope。模型文件、各来源的 revision 与选型依据见 [模型说明](models.md#翻译模型最终选型)。
 
 ## 制作分发目录
 
@@ -79,7 +79,9 @@ ASR 和 llama.cpp 的原生库分目录存放，避免不同版本的 ggml 或 C
 
 发行目录的 `examples/glossary.tsv` 是术语表模板，可用 `start.cmd --glossary .\examples\glossary.tsv` 加载。业务术语表由部署者另外提供，打包脚本只复制示例，不收集 `--glossary` 指向的私有文件。相对路径按工作目录解析，跨目录启动时宜使用绝对路径；修改表后重启服务。完整容量和前缀缓存说明见 [术语表](glossary.md)。
 
-首次启动从 ModelScope 下载模型，默认缓存到可执行文件旁的 `models`，随后用 Rust 转换 ASR 权重。该目录需要足够的磁盘空间和写入权限。模型加载和 CUDA 检查完成后，音频接口才开始监听 `127.0.0.1:3000`。音频请求和响应格式见 [README](../README.md#音频接口)。
+首次启动默认从 Hugging Face 下载模型，随后用 Rust 转换 ASR 权重。需要使用 ModelScope 时，运行 `start.cmd --model-source modelscope` 或 `streamtrans.exe --model-source modelscope`。该选项统一用于 ASR、VAD 和翻译模型，不改变原生运行库或 FFmpeg 的来源，下载失败时也不会自动切换来源。
+
+缓存根目录默认是可执行文件旁的 `models`，需要足够的磁盘空间和写入权限。不同来源的仓库版本及缓存清单分开管理；已有 ModelScope 缓存需选择 `--model-source modelscope` 才会复用。模型加载和 CUDA 检查完成后，音频接口才开始监听，默认地址为 `127.0.0.1:3000`。音频请求和响应格式见 [README](../README.md#音频接口)。
 
 托管的 `llama-server` 使用单独的回环地址临时端口和每次启动生成的 API 密钥。调用方只访问 StreamTrans 音频接口，无须配置、启动或直接连接这个子进程。StreamTrans 退出时会清理托管子进程。
 
@@ -89,9 +91,12 @@ ASR 和 llama.cpp 的原生库分目录存放，避免不同版本的 ggml 或 C
 
 ```powershell
 .\streamtrans.exe --download-only
+
+# 通过 ModelScope 准备离线缓存
+.\streamtrans.exe --model-source modelscope --download-only
 ```
 
-下载完成后，将整个 `models` 缓存目录复制到目标机器的程序目录旁，保留缓存清单和原有目录结构。运行时会校验缓存文件，完整有效的缓存可离线使用。首次运行仍可能需要生成 ASR 转换缓存；转换由 Rust 完成，不调用 Python。也可用 `--cache-dir` 指向已有的可写缓存目录。
+下载完成后，将整个 `models` 缓存目录复制到目标机器的程序目录旁，保留缓存清单和原有目录结构。离线启动时选择与下载时一致的 `--model-source`；使用版本覆盖参数时也需保持一致。运行时会校验缓存文件，完整有效的缓存可离线使用。首次运行仍可能需要生成 ASR 转换缓存；转换由 Rust 完成，不调用 Python。也可用 `--cache-dir` 指向已有的可写缓存目录。
 
 ## 验证分发目录
 
