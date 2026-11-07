@@ -7,7 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/llama-cuda128' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/llama-shared' }
 $runtime = [IO.Path]::GetFullPath($OutputDirectory)
 & (Join-Path $PSScriptRoot 'build-llama.ps1') -OutputDirectory $runtime -Jobs $Jobs
 $cudaRuntime = & (Join-Path $PSScriptRoot 'setup-cuda-runtime.ps1') -RuntimeDirectory $runtime

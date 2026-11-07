@@ -10,7 +10,7 @@ $ProgressPreference = 'SilentlyContinue'
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw '此构建需要 Windows x64 PowerShell。' }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $buildRoot = Join-Path $projectRoot '.tools/llama-build-cuda128'
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/llama-cuda128' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/llama-shared' }
 $output = [IO.Path]::GetFullPath($OutputDirectory).TrimEnd('\','/')
 $downloads = Join-Path $buildRoot 'downloads'
 $source = Join-Path $buildRoot 'source'
@@ -61,7 +61,7 @@ function Invoke-Cmake([string[]]$Arguments, [string]$Log, [string]$Failure) {
     & $cmake @Arguments 2>&1 | Tee-Object -FilePath $Log | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw $Failure }
 }
-foreach ($tool in @('cmake.exe','curl.exe','tar.exe')) {
+foreach ($tool in @('cmake.exe','curl.exe','tar.exe','git.exe')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "缺少构建工具：$tool" }
 }
 $cmake = (Get-Command cmake.exe).Source
@@ -92,6 +92,52 @@ foreach ($package in $packages) {
         Set-Content -LiteralPath $stamp -Value $package.sha256 -Encoding ascii
     }
 }
+
+# Preserve transcribe's backend allow-list and CPU starvation fix without changing
+# public ggml headers, so existing CUDA compilation units remain reusable.
+$ggmlPatches = @(
+    @{
+        name = 'ggml-backend-reg-filter.patch'; source = 'ggml/src/ggml-backend-reg.cpp'
+        sha256 = '017f906befe1193450f109ef68a9177f055f86f76949064f5b981ff0e1ca4d18'
+        original_sha256 = '1436b46bd1e8355345d454baa4b40069be73e9cb09a3a188d32426ea1e1037fe'
+        result_sha256 = 'a33e9273282c98dd43c7dbd65122bbc12c2dc80664665b01f0c5142372f64b07'
+    },
+    @{
+        name = 'ggml-cpu-threadpool.patch'; source = 'ggml/src/ggml-cpu/ggml-cpu.c'
+        sha256 = '94e10e2053943db0ba9cc2446e935775442456cf9feb70ec196f8899e00d3638'
+        original_sha256 = '97a3d16efc5bbb0417b78b9a689b32162b4e16392b044888645ecdcfec23cca1'
+        result_sha256 = 'e2b005072bc831a1cbc698236354553bb7422cf1a8a051716b96c6a1f0b2720c'
+    }
+)
+$patchCache = Join-Path $buildRoot 'patches'
+New-Item -ItemType Directory -Path $patchCache -Force | Out-Null
+$patchRecords = @()
+foreach ($patch in $ggmlPatches) {
+    $patchPath = Join-Path $projectRoot ('native/' + $patch.name)
+    if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) { throw "缺少 ggml 兼容补丁：$patchPath" }
+    $patchText = [IO.File]::ReadAllText($patchPath).Replace("`r`n", "`n")
+    $normalized = Join-Path $patchCache $patch.name
+    [IO.File]::WriteAllText($normalized, $patchText, [Text.UTF8Encoding]::new($false))
+    if (-not (Test-Hash $normalized $patch.sha256)) { throw "ggml 兼容补丁校验失败：$patchPath" }
+    $target = Join-Path $source $patch.source
+    $targetText = [IO.File]::ReadAllText($target)
+    $normalizedTarget = $targetText.Replace("`r`n", "`n")
+    $targetHasher = [Security.Cryptography.SHA256]::Create()
+    try { $targetHash = ([BitConverter]::ToString($targetHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($normalizedTarget)))).Replace('-','').ToLowerInvariant() } finally { $targetHasher.Dispose() }
+    if ($targetHash -notin @($patch.original_sha256, $patch.result_sha256)) { throw "ggml 源码与固定版本不匹配：$target；请使用未修改的下载源码重试。" }
+    if ($normalizedTarget -cne $targetText) { [IO.File]::WriteAllText($target, $normalizedTarget, [Text.UTF8Encoding]::new($false)) }
+    if (-not (Test-Hash $target $patch.result_sha256)) {
+        if (-not (Test-Hash $target $patch.original_sha256)) { throw "ggml 源码与固定版本不匹配：$target；请使用未修改的下载源码重试。" }
+        & git -c core.autocrlf=false -C $projectRoot apply --check --directory=.tools/llama-build-cuda128/source $normalized
+        if ($LASTEXITCODE -ne 0) { throw "ggml 兼容补丁不能应用：$patchPath" }
+        & git -c core.autocrlf=false -C $projectRoot apply --directory=.tools/llama-build-cuda128/source $normalized
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Hash $target $patch.result_sha256)) { throw "ggml 兼容补丁应用或结果校验失败：$patchPath" }
+    }
+    $patchRecords += @{ name = 'native/' + $patch.name; sha256 = $patch.sha256; source = $patch.source; result_sha256 = $patch.result_sha256 }
+}
+$compatibilityText = $commit + "`nGGML_OPENMP=OFF`n" + (($patchRecords | ForEach-Object { $_.name + "`t" + $_.sha256 }) -join "`n")
+$compatibilityHasher = [Security.Cryptography.SHA256]::Create()
+try { $compatibilityId = 'sha256:' + ([BitConverter]::ToString($compatibilityHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($compatibilityText)))).Replace('-','').ToLowerInvariant() } finally { $compatibilityHasher.Dispose() }
 
 # Initialize only this process; do not install CUDA or change machine/user PATH.
 $vcvars = Join-Path $vs 'VC/Auxiliary/Build/vcvars64.bat'
@@ -125,7 +171,7 @@ try {
         '-DLLAMA_BUILD_EXAMPLES=OFF', '-DLLAMA_BUILD_TOOLS=ON', '-DLLAMA_BUILD_SERVER=ON',
         '-DLLAMA_BUILD_APP=OFF', '-DLLAMA_BUILD_UI=OFF', '-DLLAMA_USE_PREBUILT_UI=OFF', '-DLLAMA_OPENSSL=OFF',
         '-DGGML_NATIVE=OFF', '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON',
-        '-DGGML_CUDA=ON', '-DGGML_CUDA_COMPRESSION_MODE=size', '-DGGML_OPENMP_FETCH=OFF'
+        '-DGGML_CUDA=ON', '-DGGML_CUDA_COMPRESSION_MODE=size', '-DGGML_OPENMP=OFF', '-DGGML_OPENMP_FETCH=OFF'
     )
     Write-Host "正在配置 llama.cpp b11960 / CUDA 12.8 ($architectures)"
     Invoke-Cmake $configuration (Join-Path $buildRoot 'configure.log') 'CMake 配置失败，请查看 .tools/llama-build-cuda128/configure.log 并修复工具链后重试。'
@@ -153,14 +199,17 @@ try {
         'LICENSE-rotate-bits' = 'vendor/hash/rotate-bits/LICENSE.md'
     }
     foreach ($name in $notices.Keys) { Copy-Item -LiteralPath (Join-Path $source $notices[$name]) -Destination (Join-Path $licenses $name) -Force }
-    # MSVC's OpenMP runtime is a redistributable; LLVM/libomp is not used in this build.
+    # Stage only the CRT imports used by the shared, non-OpenMP CPU backend.
     $cudaRuntime = & (Join-Path $PSScriptRoot 'setup-cuda-runtime.ps1') -RuntimeDirectory $output
     $redist = Join-Path $env:VCToolsRedistDir 'x64'
     $dumpbin = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/dumpbin.exe'
     $runtimeCandidates = @{}
     foreach ($directory in @('Microsoft.VC143.CRT','Microsoft.VC143.OpenMP')) {
         $runtimeDirectory = Join-Path $redist $directory
-        if (-not (Test-Path -LiteralPath $runtimeDirectory)) { throw "缺少 MSVC 可分发运行库：$runtimeDirectory" }
+        if (-not (Test-Path -LiteralPath $runtimeDirectory)) {
+            if ($directory -eq 'Microsoft.VC143.CRT') { throw "缺少 MSVC 可分发运行库：$runtimeDirectory" }
+            continue
+        }
         foreach ($dll in Get-ChildItem -LiteralPath $runtimeDirectory -File -Filter '*.dll') { $runtimeCandidates[$dll.Name] = $dll.FullName }
     }
     $pending = New-Object 'System.Collections.Generic.Queue[string]'
@@ -201,13 +250,16 @@ try {
     $files = @(Get-ChildItem -LiteralPath $output -File -Recurse | Where-Object { $_.FullName -ne $manifestPath -and $_.Name -ne '.streamtrans-build-owner' } | ForEach-Object {
         [ordered]@{ name = $_.FullName.Substring($output.Length + 1).Replace('\','/'); size = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
     })
+    $ggmlFiles = @($files | Where-Object { $_.name -match '^ggml(?:-[a-z0-9_-]+)?\.dll$' } | Sort-Object name)
     [ordered]@{
         version = 'b11960'; commit = $commit; cuda_build = '12.8'; cuda_runtime = $cudaRuntime
         compiler = $compiler; msvc_toolset = $env:VCToolsVersion; windows_sdk = $env:WindowsSDKVersion
         cmake = (& $cmake --version | Select-Object -First 1); ninja = (& $ninja --version); nvcc = (& $env:CUDACXX --version) -join "`n"
         source_tree_sha256 = $sourceTreeHash; nvcc_sha256 = (Get-FileHash -LiteralPath $env:CUDACXX -Algorithm SHA256).Hash.ToLowerInvariant()
+        source_directory = $source; build_directory = $build
+        ggml = @{ commit = $commit; compatibility_id = $compatibilityId; cpu_openmp = $false; patches = $patchRecords; files = $ggmlFiles }
         cmake_arguments = $configuration
-        cuda_architectures = $architectures.Split(';'); cuda_compression = 'size'; cpu_all_variants = $true
+        cuda_architectures = $architectures.Split(';'); cuda_compression = 'size'; cpu_all_variants = $true; cpu_openmp = $false
         ui = $false; openssl = $false; target = 'llama-server'; packages = $packages; files = $files
     } | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $manifestPath -Encoding utf8
     Write-Host "已构建 llama.cpp b11960 / CUDA 12.8：$output"

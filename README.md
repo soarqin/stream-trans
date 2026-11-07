@@ -14,13 +14,15 @@
 
 ASR 和 LLM 必须运行在 GPU 上，不自动回退 CPU。Windows 分发包包含 ASR 原生库、llama.cpp、CUDA 运行库和 FFmpeg；运行机器仍需兼容的 NVIDIA 驱动。项目不内置模型权重，首次启动默认从 **Hugging Face** 下载三个固定版本，也可通过 `--model-source modelscope` 选择 **ModelScope**。模型由 Rust 下载、校验并转换 ASR 缓存，后续复用并支持离线启动。来源、精度与限制见 [模型说明](docs/models.md)，打包与部署见 [分发说明](docs/distribution.md)。
 
-Windows 分发目录将一套共享的 CUDA 12.8 运行库和 FFmpeg 解码 DLL 放在 `runtime` 根目录，ASR 与 llama.cpp 各自的 ggml 保留在独立子目录。llama.cpp 固定为 b11960 源码，使用 CUDA Toolkit 12.8.1 本地编译，与 ASR 使用相同版本的 CUDA 运行库。文件上传在进程内解码，不启动 FFmpeg 子进程；实时录音直接传输 PCM，不经过 FFmpeg。
+Windows 分发目录将 ASR、llama.cpp、唯一一套 ggml、CUDA 12.8 运行库和 FFmpeg 解码 DLL 全部放在 `runtime` 根目录。ggml 使用 llama.cpp b11960 随附的 0.28 源码并应用 transcribe 兼容补丁；transcribe.cpp 0.4.1 使用同一套头文件和库重新编译，使 ASR 与 LLM 共用 `ggml.dll`、`ggml-base.dll`、`ggml-cuda.dll` 和 CPU 后端。原预编译 ASR 的 ggml 0.26 不能直接与 0.28 混用。文件上传在进程内解码，不启动 FFmpeg 子进程；实时录音直接传输 PCM，不经过 FFmpeg。
 
-2026-11-07 的 Windows 实测发行目录缩小约 44.3%；9.12 秒 WAV 的独立规范化耗时中位数由 32.1 ms 降至 6.7 ms。构建、预热方法、音频完整性、模块来源和限制见 [共享运行库验证](docs/shared-runtime-20261107.md)。
+当前统一 ggml 的构建与验证记录见 [共享 ggml 验证](docs/shared-ggml-20261107.md)。此前仅共享 CUDA 并改用 FFmpeg DLL 的 [共享运行库验证](docs/shared-runtime-20261107.md) 保留为历史记录，其中的包体积与性能数字不代表当前统一 ggml 构建。
 
 ## Windows 安装与启动
 
 源码构建需要 Windows x64、Rust stable 和 Visual Studio 2022 C++ Build Tools（「使用 C++ 的桌面开发」组件）。构建 llama.cpp 前需安装 CMake 并将其加入 `PATH`；Ninja 可从 `PATH` 获取，也可复用 Visual Studio 随带的组件。构建脚本将固定的 CUDA 12.8.1 编译组件下载到项目内 `.tools/llama-build-cuda128/cuda`，无须全局安装 CUDA Toolkit，也不使用 Python。运行机器只需兼容随包 CUDA 运行库的 NVIDIA 驱动；GPU 需支持原生 BF16，显存需同时容纳 ASR、LLM 及推理缓存。
+
+构建机还需将 Git 加入 `PATH`，用于应用并校验 ggml 兼容补丁；Git 不进入运行包。
 
 在项目根目录运行：
 
@@ -29,11 +31,11 @@ powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
 .\target\release\streamtrans.exe
 ```
 
-安装脚本下载并校验固定版本的 ASR 原生库、llama.cpp 源码、CUDA 组件和 FFmpeg 9.0 LGPL 共享库，构建 llama.cpp 和小型音频桥接 DLL，再编译 Rust 发布版本。FFmpeg 头文件和导入库只用于构建，不进入分发包；不使用 Python、pkg-config 或 bindgen。首次安装需要联网访问上游下载站点和 crates.io；模型在服务首次启动时下载。开发模式从项目根目录启动，并保留 `.tools` 中的运行库和 `models` 缓存。
+安装脚本下载并校验固定版本的 llama.cpp、transcribe.cpp 源码、CUDA 组件和 FFmpeg 9.0 LGPL 共享库，依次构建带兼容补丁的 llama.cpp/ggml、使用同源 ggml 的 ASR、小型音频桥接 DLL，最后编译 Rust 发布版本。ggml CPU 后端关闭 OpenMP，使用原生线程池；ASR 和 LLM 仍强制使用 GPU。FFmpeg 头文件和导入库只用于构建，不进入分发包；不使用 Python、pkg-config 或 bindgen。首次安装需要联网访问上游下载站点和 crates.io；模型在服务首次启动时下载。开发模式从项目根目录启动，并保留 `.tools` 中的运行库和 `models` 缓存。
 
-Windows 安装通过 `scripts/setup-cuda-runtime.ps1` 为两个后端准备相同版本的 CUDA 运行 DLL，复用下载缓存。开发目录各自保留 DLL 副本，制作分发目录时仅携带一套共享副本。CUDA Toolkit 和 NVCC 只用于构建机器，不进入分发目录。
+Windows 安装通过 `scripts/setup-cuda-runtime.ps1` 准备 CUDART 12.8.90 和 cuBLAS 12.8.4.1，复用下载缓存。两个开发目录保留同源依赖副本，制作分发目录时只携带一套 ggml 和 CUDA DLL。打包会交叉核对 ggml 源码提交、兼容补丁标识和完整文件 SHA256，拒绝混合旧库。CUDA Toolkit 和 NVCC 只用于构建机器，不进入分发目录；仓库只保留源码、兼容补丁和构建脚本，不提交下载缓存或编译产物。
 
-单独构建 llama.cpp 可运行 `scripts/setup-llama.ps1 -Jobs 4`，默认输出到 `.tools/llama-cuda128`；`-OutputDirectory` 可覆盖此目录。
+单独构建 llama.cpp 可运行 `scripts/setup-llama.ps1 -Jobs 4`，默认输出到 `.tools/llama-shared`。随后运行 `scripts/build-asr.ps1 -Jobs 4`，默认从该目录复用 ggml，ASR 输出到 `.tools/transcribe-shared`。两个脚本均支持 `-OutputDirectory`；ASR 的 `-LlamaDirectory` 可指定配套 llama 构建。
 
 重新构建或运行检查：
 

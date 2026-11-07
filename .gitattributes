@@ -1,0 +1,2 @@
+# A blank context line in a unified diff contains the required space marker.
+native/ggml-*.patch text eol=lf whitespace=-blank-at-eol

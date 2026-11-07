@@ -1,6 +1,6 @@
 # Windows 分发与部署
 
-分发目录包含 StreamTrans、ASR 原生库、llama.cpp、一套共享 CUDA 12.8 运行库、FFmpeg 共享库和第三方许可证，不包含模型权重、模型转换缓存、Python 环境或 CUDA 编译工具。运行机器需要 Windows x64、支持原生 BF16 的 NVIDIA GPU，以及兼容随包 CUDA 运行库的 NVIDIA 驱动。
+分发目录包含 StreamTrans、ASR 原生库、llama.cpp、唯一一套 ggml、共享 CUDA 12.8 运行库、FFmpeg 共享库和第三方许可证，不包含模型权重、模型转换缓存、Python 环境或 CUDA 编译工具。运行机器需要 Windows x64、支持原生 BF16 的 NVIDIA GPU，以及兼容随包 CUDA 运行库的 NVIDIA 驱动。
 
 最终翻译模型选定为 **Hy-MT2-1.8B GGUF Q6_K**（2026-11-03），首次启动默认从 Hugging Face 下载固定版本，也可通过 `--model-source modelscope` 使用 ModelScope。模型文件、各来源的 revision 与选型依据见 [模型说明](models.md#翻译模型最终选型)。
 
@@ -8,7 +8,11 @@
 
 构建机器需要 Rust stable、Visual Studio 2022 C++ Build Tools（「使用 C++ 的桌面开发」组件）和可访问上游下载站点的网络。构建 llama.cpp 前需安装 CMake 并将其加入 `PATH`；Ninja 可从 `PATH` 获取，也可复用 Visual Studio 随带的组件。构建脚本将固定的 CUDA 12.8.1 编译组件下载到项目内 `.tools/llama-build-cuda128/cuda`，无须全局安装 CUDA Toolkit。单独重新编译 Rust 服务不使用 NVCC；构建与运行均不需要 Python。
 
-Windows 安装脚本通过 `scripts/setup-cuda-runtime.ps1` 为两个后端准备相同的 CUDART 12.8.90、cuBLAS 12.8.4.1 及许可文件，并共用下载缓存。ASR 保留 transcribe.cpp v0.4.1 的 CUDA 12.8 编译产物；llama.cpp b11960 从固定提交 `8642541b255bfb5dc39cd351a178be09013a55d6` 使用 CUDA Toolkit 12.8.1 构建。两个后端的编译和运行均采用 CUDA 12.8。CMake、Ninja、CUDA Toolkit 和 NVCC 只用于构建机器，不进入分发目录。
+Windows 安装依次构建 llama.cpp/ggml、ASR、FFmpeg 音频桥和 Rust 服务。ggml 以 llama.cpp b11960 固定提交 `8642541b255bfb5dc39cd351a178be09013a55d6` 随附的 0.28 源码为基础，应用 transcribe 后端注册过滤与 CPU 线程池兼容补丁；CPU 后端关闭 OpenMP，使用原生线程池。transcribe.cpp 0.4.1 从固定源码针对同一套 ggml 头文件和库重编，不再下载生产用 ASR 预编译包。
+
+构建机还需将 Git 加入 `PATH`，脚本用它应用兼容补丁并检查补丁结果；不会修改用户的全局 Git 配置。
+
+CUDA 运行库通过 `scripts/setup-cuda-runtime.ps1` 准备，固定为 CUDART 12.8.90 与 cuBLAS 12.8.4.1；两个后端的编译和运行均采用 CUDA 12.8。构建记录保留 ggml 源码提交、兼容补丁标识和全部共享 DLL 的 SHA256，制作发行目录时交叉校验 ASR 与 llama.cpp 的记录。CMake、Ninja、CUDA Toolkit 和 NVCC 只用于构建机器，不进入分发目录；仓库只包含源码、补丁和构建脚本，编译二进制与下载缓存位于忽略目录。
 
 1. 在项目根目录准备原生程序并构建服务。
 
@@ -41,7 +45,8 @@ powershell -ExecutionPolicy Bypass -File scripts/dist.ps1 -FfmpegDirectory .tool
 | `-SkipBuild` | 使用已经构建的 Rust 发布程序 |
 | `-FfmpegDirectory` | 指定包含 `bin` 和构建来源清单的 FFmpeg 共享库目录，默认 `.tools/ffmpeg-shared` |
 | `-MsvcRedistDirectory` | 指定需要随包携带的 MSVC 运行库目录 |
-| `-LlamaDirectory` | 指定固定 b11960 / CUDA 12.8 构建目录，默认 `.tools/llama-cuda128` |
+| `-LlamaDirectory` | 指定带兼容补丁的 b11960 / CUDA 12.8 构建目录，默认 `.tools/llama-shared` |
+| `-AsrDirectory` | 指定链接同源 ggml 的 transcribe.cpp 0.4.1 构建目录，默认 `.tools/transcribe-shared` |
 
 FFmpeg 许可证和源码地址必须对应实际打包的二进制。分发时应一并保留适用的许可、版权声明和源码获取说明；打包脚本不替代上游授权。
 
@@ -56,6 +61,16 @@ dist/StreamTrans/
 ├── manifest.json
 ├── THIRD_PARTY.json
 ├── runtime/
+│   ├── transcribe.dll
+│   ├── llama-server.exe
+│   ├── llama-server-impl.dll
+│   ├── llama-common.dll
+│   ├── llama.dll
+│   ├── mtmd.dll
+│   ├── ggml.dll          # ASR 与 LLM 共用
+│   ├── ggml-base.dll
+│   ├── ggml-cuda.dll
+│   ├── ggml-cpu-*.dll    # 9 个通用 CPU 变体，运行时选择适合本机的一种
 │   ├── cudart64_12.dll    # 共享 CUDART 12.8.90
 │   ├── cublas64_12.dll    # 共享 cuBLAS 12.8.4.1
 │   ├── cublasLt64_12.dll
@@ -66,9 +81,7 @@ dist/StreamTrans/
 │   ├── swresample-7.dll
 │   ├── msvcp140.dll
 │   ├── vcruntime140.dll
-│   ├── vcruntime140_1.dll
-│   ├── asr/              # transcribe.dll 与独立的 ASR ggml 后端
-│   └── llama/            # llama-server.exe 与独立的 llama ggml、服务端依赖
+│   └── vcruntime140_1.dll
 └── licenses/
     ├── asr/
     ├── llama/
@@ -77,11 +90,11 @@ dist/StreamTrans/
     └── ffmpeg/
 ```
 
-CUDA、FFmpeg 和共享 MSVC DLL 放在 `runtime` 根目录；主程序目录额外保留一份 `vcruntime140.dll`，使 Rust 程序能够先启动。两个后端子目录不再各自携带 CUDA 和 MSVC 副本。打包只保留实际运行依赖，不包含 ASR 的可选 Vulkan 后端及 llama.cpp 的独立 CLI、基准和 RPC 工具组件。
+全部原生模型库、唯一一套 ggml、CUDA、FFmpeg 和共享 MSVC DLL 平铺在 `runtime` 根目录；主程序目录额外保留一份 `vcruntime140.dll`，使 Rust 程序能够先启动。ggml CPU 后端使用原生线程池，不依赖 OpenMP 运行库。打包只保留实际运行依赖，不包含 ASR 的可选 Vulkan 后端及 llama.cpp 的独立 CLI、基准和 RPC 工具组件。
 
-两套 ggml 使用各自的 ABI，ASR 还依赖其配套 ggml 的 `ggml_backend_set_reg_filter` 等入口点。统一 CUDA 版本后仍将后端保留在 `runtime/asr`、`runtime/llama`，不能将两个目录中的同名 ggml DLL 平铺覆盖。此布局用于新生成的分发目录；打包脚本不会清理或覆盖已有分发目录。
+旧 ASR 预编译包使用 ggml 0.26，不能直接配合 llama.cpp b11960 的 ggml 0.28。当前平铺布局以统一源码和兼容补丁、重编 ASR 为前提；不能通过手工搬运同名 DLL 或只替换 `ggml-cuda.dll` 来升级。使用新的完整分发目录，不要混入旧版 `transcribe.dll` 或 ggml 文件。打包脚本会拒绝 ASR 与 llama.cpp 的 ggml 身份、文件集合或 SHA256 不一致的来源，也不会清理或覆盖已有分发目录。
 
-`manifest.json` 记录分发文件及其 SHA256；`THIRD_PARTY.json` 记录 llama.cpp 的固定源码提交、CUDA 编译版本和运行版本，并在 `shared_cuda` 中记录共享 CUDA 组件的版本、来源及校验值。模型版本与校验由运行时模型缓存清单管理。
+`manifest.json` 记录分发文件及其 SHA256；`THIRD_PARTY.json` 记录 ASR 与 llama.cpp 的固定源码、构建过程、CUDA 编译版本和运行版本。`shared_ggml` 保存 ggml 源码提交、兼容补丁标识及完整 DLL 校验值，`shared_cuda` 保存 CUDA 组件的版本、来源及校验值。模型版本与校验由运行时模型缓存清单管理。
 
 ## 在运行机器启动
 
@@ -89,11 +102,11 @@ CUDA、FFmpeg 和共享 MSVC DLL 放在 `runtime` 根目录；主程序目录额
 2. 确认 NVIDIA 驱动已安装，GPU 满足 BF16 和显存要求。
 3. 运行 `start.cmd`，或直接运行 `streamtrans.exe`。
 
-程序自动查找可执行文件旁的 `runtime/asr/transcribe.dll`、`runtime/llama/llama-server.exe` 和 `runtime/streamtrans-ffmpeg.dll`。`--asr-library`、`--llama-server` 和 `--ffmpeg-library` 可显式覆盖这些路径。Windows 服务不再接受旧 `--ffmpeg` EXE 参数；升级时应复制完整新发行目录。
+程序优先查找可执行文件旁的 `runtime/transcribe.dll`、`runtime/llama-server.exe` 和 `runtime/streamtrans-ffmpeg.dll`；仍可发现旧的 `runtime/asr/transcribe.dll` 与 `runtime/llama/llama-server.exe` 入口路径，但不允许把旧 ggml 混入新包。`--asr-library`、`--llama-server` 和 `--ffmpeg-library` 可显式覆盖这些路径。Windows 服务不再接受旧 `--ffmpeg` EXE 参数；升级时应复制完整新发行目录。
 
 FFmpeg DLL 在启动时加载并保留至进程退出，启动检查和文件上传均不创建 FFmpeg 子进程。文件解码使用首个音轨，转换为单声道 16 kHz PCM，保留 32 MiB 上传、配置时长及 30 秒解码时限；逐帧检查容量与截止时间，结束时冲刷解码器和重采样器。`elapsed_ms.audio_decode` 单独报告文件解码和规范化耗时。原生解码使用中断回调和循环检查；该时限不是可强制杀死任意原生函数的进程隔离。实时录音路径直接处理客户端发来的 PCM，不经过 FFmpeg。
 
-ASR 注册自己的后端目录及共享 `runtime` 目录，llama-server 的子进程搜索路径包含后端目录和共享目录。部署时需复制完整分发目录，无须依赖系统 `PATH` 中另行安装的 CUDA 或 FFmpeg。
+ASR 从 `transcribe.dll` 同目录加载后端，llama-server 从可执行文件目录与当前工作目录发现 ggml 插件。平铺布局使两者都使用同一个 `runtime` 目录，静态依赖和动态选择的 CPU/CUDA 插件均来自这里。部署时需复制完整分发目录，无须依赖系统 `PATH` 中另行安装的 ggml、CUDA 或 FFmpeg。
 
 发行目录的 `examples/glossary.tsv` 是术语表模板，可用 `start.cmd --glossary .\examples\glossary.tsv` 加载。业务术语表由部署者另外提供，打包脚本只复制示例，不收集 `--glossary` 指向的私有文件。相对路径按工作目录解析，跨目录启动时宜使用绝对路径；修改表后重启服务。完整容量和前缀缓存说明见 [术语表](glossary.md)。
 
@@ -133,7 +146,7 @@ $env:STREAMTRANS_REQUEST_KEY = 'your-key'
 
 `streamtrans.exe --help` 可检查主程序是否能启动，但不会加载 GPU 模型。完整验证还需要首次下载、ASR 转换、两个 GPU 后端加载，以及真实音频请求。启动后通过 `GET /health` 检查后端状态，并按 README 上传一段有效音频。
 
-共享 CUDA 布局还需核对实际进程模块：父进程与 llama-server 应从同一个 `runtime` 根目录加载三份 CUDA DLL，各自的 ggml 应来自对应后端子目录。静态导入符号齐全不能替代这项加载路径检查和真实 GPU 请求。
+统一 ggml 布局还需核对实际进程模块：父进程与 llama-server 的 ggml、ggml-base、ggml-cuda 及所选 CPU 后端均应来自同一个 `runtime` 根目录，路径和 SHA256 一致；三份 CUDA DLL 也只保留一套。静态导入符号齐全不能替代这项加载路径检查和真实 GPU 请求。当前构建的验证记录见 [共享 ggml 验证](shared-ggml-20261107.md)。
 
 性能结果应记录运行机器、驱动、音频、目标语言、进程首请求与后续请求，并将模型下载和加载时间单独列出。后端切换前的 [Candle 对照数据](sampling-benchmark.md) 不能作为当前分发包的 HTTP 性能结果。
 
@@ -141,7 +154,7 @@ Linux 安装脚本下载官方预编译 CUDA 后端，但 Linux 分发包、Ubun
 
 ## 验证记录
 
-2026-11-07 的共享 CUDA 与进程内 FFmpeg DLL 发行验证见 [共享运行库验证](shared-runtime-20261107.md)，包含约 44.3% 的目录缩减、音频逐采样对照、真实 GPU 请求及模块来源。下述段落是早期分目录运行库与 FFmpeg EXE 的历史记录。
+当前统一 ggml 构建的验证记录见 [共享 ggml 验证](shared-ggml-20261107.md)。此前仅共享 CUDA 与进程内 FFmpeg DLL 的 [共享运行库验证](shared-runtime-20261107.md) 保留为历史记录，其中约 44.3% 的目录缩减和性能数字不代表当前构建。下述段落是更早的分目录运行库与 FFmpeg EXE 验证记录。
 
 本节保留切回 llama.cpp 时初版发行目录的验证结果。新增连续录音接口后的验证见 [实时接口说明](streaming.md#验证记录)；当前文件数量与校验值以 `manifest.json` 为准。
 

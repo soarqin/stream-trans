@@ -1,4 +1,3 @@
-#[cfg(not(windows))]
 use std::path::Path;
 use std::{fmt, net::SocketAddr, path::PathBuf};
 
@@ -105,16 +104,16 @@ impl Config {
 }
 
 fn default_asr_library() -> PathBuf {
-    let packaged = bundled_path(if cfg!(windows) {
-        "runtime/asr/transcribe.dll"
+    let name = if cfg!(windows) {
+        "transcribe.dll"
     } else {
-        "runtime/asr/libtranscribe.so"
-    });
-    if packaged.is_file() {
+        "libtranscribe.so"
+    };
+    if let Some(packaged) = packaged_backend(&bundled_path("runtime"), name, "asr") {
         return packaged;
     }
     if cfg!(windows) {
-        ".tools/transcribe/transcribe-native-windows-x86_64-cuda/transcribe.dll".into()
+        ".tools/transcribe-shared/transcribe.dll".into()
     } else {
         ".tools/transcribe/libtranscribe.so".into()
     }
@@ -128,19 +127,24 @@ fn bundled_path(relative: &str) -> PathBuf {
 }
 
 fn default_llama_server() -> PathBuf {
-    let relative = if cfg!(windows) {
-        "runtime/llama/llama-server.exe"
+    let name = if cfg!(windows) {
+        "llama-server.exe"
     } else {
-        "runtime/llama/llama-server"
+        "llama-server"
     };
-    let packaged = bundled_path(relative);
-    if packaged.is_file() {
+    if let Some(packaged) = packaged_backend(&bundled_path("runtime"), name, "llama") {
         packaged
     } else if cfg!(windows) {
-        ".tools/llama-cuda128/llama-server.exe".into()
+        ".tools/llama-shared/llama-server.exe".into()
     } else {
         ".tools/llama/llama-server".into()
     }
+}
+
+fn packaged_backend(runtime: &Path, name: &str, legacy: &str) -> Option<PathBuf> {
+    [runtime.join(name), runtime.join(legacy).join(name)]
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 #[cfg(not(windows))]
@@ -181,6 +185,23 @@ fn default_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_backends_prefer_shared_directory_and_accept_legacy_layout() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let runtime = temporary.path();
+        for (name, legacy) in [("transcribe.dll", "asr"), ("llama-server.exe", "llama")] {
+            assert!(packaged_backend(runtime, name, legacy).is_none());
+            std::fs::create_dir(runtime.join(legacy))?;
+            let old = runtime.join(legacy).join(name);
+            std::fs::write(&old, [])?;
+            assert_eq!(packaged_backend(runtime, name, legacy), Some(old));
+            let shared = runtime.join(name);
+            std::fs::write(&shared, [])?;
+            assert_eq!(packaged_backend(runtime, name, legacy), Some(shared));
+        }
+        Ok(())
+    }
 
     #[cfg(not(windows))]
     #[test]
