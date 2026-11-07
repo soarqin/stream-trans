@@ -47,6 +47,20 @@ function Assert-RecordedArtifact([string]$Directory, $Files, [string]$Name, [str
     }
 }
 
+function Assert-EmbeddedServer($Metadata) {
+    $exports = @('streamtrans_server_abi_version','streamtrans_server_create','streamtrans_server_run','streamtrans_server_request_stop','streamtrans_server_status','streamtrans_server_destroy')
+    if (-not $Metadata.PSObject.Properties['embedded_server'] -or $Metadata.embedded_server -isnot [pscustomobject]) {
+        throw 'llama.cpp 缺少进程内服务构建记录，请重新运行 scripts/setup-llama.ps1。'
+    }
+    $embedded = $Metadata.embedded_server
+    if (-not $embedded.PSObject.Properties['abi_version'] -or $embedded.abi_version -ne 1 -or
+        -not $embedded.PSObject.Properties['library'] -or $embedded.library -cne 'llama-server-impl.dll' -or
+        -not $embedded.PSObject.Properties['exports'] -or @($embedded.exports).Count -ne $exports.Count -or
+        @(Compare-Object $exports @($embedded.exports) -CaseSensitive).Count) {
+        throw 'llama.cpp 进程内服务 ABI、动态库或导出入口不匹配，请重新运行 scripts/setup-llama.ps1。'
+    }
+}
+
 function Get-SharedGgmlFiles($AsrMetadata, $LlamaMetadata) {
     $sets = @()
     foreach ($metadata in @($AsrMetadata, $LlamaMetadata)) {
@@ -88,7 +102,7 @@ function Get-SharedGgmlFiles($AsrMetadata, $LlamaMetadata) {
 
 if (-not $AsrDirectory) { $AsrDirectory = Join-Path $projectRoot '.tools/transcribe-shared' }
 $asr = [IO.Path]::GetFullPath($AsrDirectory)
-if (-not $LlamaDirectory) { $LlamaDirectory = Join-Path $projectRoot '.tools/llama-shared' }
+if (-not $LlamaDirectory) { $LlamaDirectory = Join-Path $projectRoot '.tools/llama-embedded' }
 $llama = [IO.Path]::GetFullPath($LlamaDirectory)
 $msvcLicenses = Join-Path $projectRoot '.tools/licenses/msvc'
 $asrDlls = @('transcribe.dll')
@@ -102,7 +116,7 @@ $sharedCuda = @{
 }
 foreach ($required in @(
     (Join-Path $asr 'licenses/LICENSE'), (Join-Path $asr '.streamtrans-runtime.json'),
-    (Join-Path $llama 'llama-server.exe'), (Join-Path $llama 'licenses/LICENSE-llama.cpp'),
+    (Join-Path $llama 'licenses/LICENSE-llama.cpp'),
     (Join-Path $llama 'licenses/cuda/cuda_cudart-LICENSE'), (Join-Path $llama 'licenses/cuda/libcublas-LICENSE'),
     (Join-Path $llama '.streamtrans-runtime.json'),
     (Join-Path $msvcLicenses 'Visual-C-Runtime-2015-2022-License.docx')
@@ -111,6 +125,7 @@ foreach ($required in @(
 }
 $asrProvenance = Get-Content -LiteralPath (Join-Path $asr '.streamtrans-runtime.json') -Raw | ConvertFrom-Json
 $llamaProvenance = Get-Content -LiteralPath (Join-Path $llama '.streamtrans-runtime.json') -Raw | ConvertFrom-Json
+Assert-EmbeddedServer $llamaProvenance
 $llamaCudaBuild = if ($llamaProvenance.PSObject.Properties['cuda_build']) { $llamaProvenance.cuda_build } else { $null }
 $llamaRuntimeMatches = $llamaProvenance.PSObject.Properties['cuda_runtime'] -and
     $llamaProvenance.cuda_runtime.PSObject.Properties['version'] -and $llamaProvenance.cuda_runtime.version -eq '12.8.1'
@@ -128,6 +143,7 @@ $sharedMsvc = @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')
 $llamaDlls = @(Get-ChildItem -LiteralPath $llama -File -Filter '*.dll' | Where-Object {
     $_.Name -in $llamaCoreDlls -or $_.Name -in $llamaOptionalDlls
 } | Select-Object -ExpandProperty Name)
+$llamaRuntimeFiles = @($llamaDlls + $sharedGgmlDlls)
 if ($llamaDlls -contains 'libomp.dll' -and -not (Test-Path -LiteralPath (Join-Path $llama 'licenses/LICENSE-LLVM-OpenMP') -PathType Leaf)) {
     throw 'llama.cpp 使用 libomp.dll，但缺少 LLVM OpenMP 许可证。'
 }
@@ -139,7 +155,7 @@ foreach ($name in $asrDlls + @($asrLicenseFiles | ForEach-Object { 'licenses/' +
     Assert-RecordedArtifact $asr $asrProvenance.files $name 'transcribe.cpp' 'scripts/build-asr.ps1'
 }
 $llamaLicenseFiles = @(Get-ChildItem -LiteralPath (Join-Path $llama 'licenses') -File)
-foreach ($name in $llamaDlls + $sharedGgmlDlls + @('llama-server.exe') + @($llamaLicenseFiles | ForEach-Object { 'licenses/' + $_.Name })) {
+foreach ($name in $llamaRuntimeFiles + @($llamaLicenseFiles | ForEach-Object { 'licenses/' + $_.Name })) {
     Assert-RecordedArtifact $llama $llamaProvenance.files $name
 }
 foreach ($name in $sharedGgmlDlls) { Assert-RecordedArtifact $llama $llamaProvenance.ggml.files $name }
@@ -206,7 +222,7 @@ New-Item -ItemType Directory -Path $output,$runtimeShared -Force | Out-Null
 foreach ($name in @('asr','llama','cuda','msvc','ffmpeg')) { New-Item -ItemType Directory -Path (Join-Path $licenseRoot $name) -Force | Out-Null }
 Copy-Exclusive $executable (Join-Path $output 'streamtrans.exe')
 foreach ($name in $asrDlls) { Copy-Exclusive (Join-Path $asr $name) (Join-Path $runtimeShared $name) }
-foreach ($name in ($llamaDlls + $sharedGgmlDlls + @('llama-server.exe'))) { Copy-Exclusive (Join-Path $llama $name) (Join-Path $runtimeShared $name) }
+foreach ($name in $llamaRuntimeFiles) { Copy-Exclusive (Join-Path $llama $name) (Join-Path $runtimeShared $name) }
 foreach ($name in $sharedCuda.Keys) { Copy-Exclusive (Join-Path $llama $name) (Join-Path $runtimeShared $name) }
 foreach ($name in $ffmpegDlls) { Copy-Exclusive (Join-Path $ffmpeg ('bin/' + $name)) (Join-Path $runtimeShared $name) }
 foreach ($name in $sharedMsvc) { Copy-Exclusive (Join-Path $MsvcRedistDirectory $name) (Join-Path $runtimeShared $name) }

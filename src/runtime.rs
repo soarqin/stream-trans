@@ -77,6 +77,13 @@ pub struct Runtime {
     inference_timeout: Duration,
 }
 
+struct CancelStartup(Arc<AtomicBool>);
+impl Drop for CancelStartup {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 impl Runtime {
     pub async fn check_tools(config: &Config) -> Result<()> {
         if config.download_only {
@@ -103,10 +110,17 @@ impl Runtime {
             "找不到 ASR 原生库 {}，请先运行 scripts/setup.ps1",
             config.asr_library.display()
         );
+        #[cfg(not(windows))]
         ensure!(
             config.llama_server.is_file(),
             "找不到 llama-server {}，请运行 scripts/setup.ps1 或使用 --llama-server 指定路径",
             config.llama_server.display()
+        );
+        #[cfg(windows)]
+        ensure!(
+            config.llama_library.is_file(),
+            "找不到进程内翻译库 {}，请运行 scripts/setup.ps1 或使用 --llama-library 指定路径",
+            config.llama_library.display()
         );
         Ok(())
     }
@@ -119,6 +133,8 @@ impl Runtime {
         let config = config.clone();
         let startup_timeout = Duration::from_secs(config.startup_timeout_seconds);
         let inference_timeout = Duration::from_secs(config.inference_timeout_seconds);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelStartup(cancelled.clone());
         let engine = timeout(
             startup_timeout,
             tokio::task::spawn_blocking(move || -> Result<Engine> {
@@ -134,16 +150,24 @@ impl Runtime {
                     tracing::info!("首次启动：使用 Rust 转换 Fun-ASR BF16 权重，后续复用转换缓存");
                     crate::convert_asr::convert(&models.asr_dir, &converted)?;
                 }
+                ensure!(!cancelled.load(Ordering::Acquire), "模型启动已取消");
                 let vad = Arc::new(Vad::load(&models.vad_dir)?);
+                ensure!(!cancelled.load(Ordering::Acquire), "模型启动已取消");
                 let asr = Asr::load(&config.asr_library, &converted, config.gpu as usize)?;
+                ensure!(!cancelled.load(Ordering::Acquire), "模型启动已取消");
                 let mut llm = Llm::load(
+                    #[cfg(not(windows))]
                     &config.llama_server,
+                    #[cfg(windows)]
+                    &config.llama_library,
                     &models.llm_file,
                     config.gpu as usize,
                     config.context_size,
                     config.max_tokens,
                     startup_timeout,
+                    &cancelled,
                 )?;
+                ensure!(!cancelled.load(Ordering::Acquire), "模型启动已取消");
                 if let Some(glossary) = glossary {
                     llm.set_glossary(&glossary, config.glossary_max_tokens)?;
                 }

@@ -37,7 +37,7 @@ Get-ScriptAst 'setup-llama.ps1' | Out-Null
 Get-ScriptAst 'build-llama.ps1' | Out-Null
 if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'build-asr.ps1')) { Get-ScriptAst 'build-asr.ps1' | Out-Null }
 if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'build-ffmpeg.ps1')) { Get-ScriptAst 'build-ffmpeg.ps1' | Out-Null }
-foreach ($name in @('Assert-EmptyOutput','Copy-Exclusive','Assert-RecordedArtifact','Get-SharedGgmlFiles')) { Invoke-Expression (Import-Function $dist $name) }
+foreach ($name in @('Assert-EmptyOutput','Copy-Exclusive','Assert-RecordedArtifact','Assert-EmbeddedServer','Get-SharedGgmlFiles')) { Invoke-Expression (Import-Function $dist $name) }
 foreach ($name in @('Test-VerifiedFile','Copy-VerifiedFile')) { Invoke-Expression (Import-Function $cuda $name) }
 Invoke-Expression (Get-Assignment $dist 'asrDlls')
 Invoke-Expression (Get-Assignment $dist 'llamaCoreDlls')
@@ -61,7 +61,28 @@ foreach ($package in $packages) { foreach ($name in $package.Dlls.Keys) { $packa
 if ($sharedCuda.Count -ne 3 -or $packageDlls.Count -ne 3) { throw 'CUDA 运行文件集合不完整' }
 foreach ($name in $sharedCuda.Keys) { if ($sharedCuda[$name] -ne $packageDlls[$name]) { throw "安装与分发 CUDA 校验值不一致：$name" } }
 if ($asrDlls.Count -ne 1 -or $asrDlls[0] -ne 'transcribe.dll') { throw 'ASR 集合应只包含模型库，共享 ggml 不能重复打包' }
+if ($llamaCoreDlls.Count -ne 4 -or @($llamaCoreDlls | Where-Object { $_ -notin @('llama-server-impl.dll','llama-common.dll','llama.dll','mtmd.dll') }).Count) { throw 'llama.cpp 进程内服务动态库集合不正确' }
 if ($ggmlCoreDlls.Count -ne 3 -or @($ggmlCoreDlls | Where-Object { $_ -notin @('ggml.dll','ggml-base.dll','ggml-cuda.dll') }).Count) { throw '共享 ggml 核心集合不正确' }
+$embeddedMetadata = [pscustomobject]@{ embedded_server = [pscustomobject]@{
+    abi_version = 1; library = 'llama-server-impl.dll'
+    exports = @('streamtrans_server_abi_version','streamtrans_server_create','streamtrans_server_run','streamtrans_server_request_stop','streamtrans_server_status','streamtrans_server_destroy')
+} }
+Assert-EmbeddedServer $embeddedMetadata
+foreach ($change in @('missing','abi','library','exports','duplicate','case','type')) {
+    $bad = $embeddedMetadata | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    switch ($change) {
+        'missing' { $bad = [pscustomobject]@{ version = 'b11960' } }
+        'abi' { $bad.embedded_server.abi_version = 2 }
+        'library' { $bad.embedded_server.library = 'llama-server.exe' }
+        'exports' { $bad.embedded_server.exports = @($bad.embedded_server.exports | Select-Object -Skip 1) }
+        'duplicate' { $bad.embedded_server.exports[0] = $bad.embedded_server.exports[1] }
+        'case' { $bad.embedded_server.exports[0] = $bad.embedded_server.exports[0].ToUpperInvariant() }
+        'type' { $bad.embedded_server = 'external-process' }
+    }
+    $rejected = $false
+    try { Assert-EmbeddedServer $bad } catch { $rejected = $true }
+    if (-not $rejected) { throw "进程内服务校验未拒绝不兼容构建：$change" }
+}
 foreach ($metadata in @(
     [pscustomobject]@{ cuda_runtime = [pscustomobject]@{ version = '12.8.1' } },
     [pscustomobject]@{ cuda_runtime = [pscustomobject]@{ version = '12.4' } },
@@ -81,7 +102,7 @@ $source = Join-Path $temporary 'source.txt'
 $target = Join-Path $temporary 'target.txt'
 $nativeDirectory = Join-Path $temporary 'native'
 $flatDirectory = Join-Path $temporary 'runtime'
-$nativeNames = @('ggml-cpu.dll','ggml-cpu-zen4.dll','vcomp140.dll','llama-bench-impl.dll','llama-embedding-impl.dll','unrelated.dll','ggml-rpc.dll','ggml-vulkan.dll') + $asrDlls + $llamaCoreDlls + $ggmlCoreDlls + @($sharedCuda.Keys) + $sharedMsvc
+$nativeNames = @('llama-server.exe','ggml-cpu.dll','ggml-cpu-zen4.dll','vcomp140.dll','llama-bench-impl.dll','llama-embedding-impl.dll','unrelated.dll','ggml-rpc.dll','ggml-vulkan.dll') + $asrDlls + $llamaCoreDlls + $ggmlCoreDlls + @($sharedCuda.Keys) + $sharedMsvc
 try {
     $output = $temporary
     Assert-EmptyOutput
@@ -145,8 +166,13 @@ try {
         if (-not $rejected) { throw "共享 ggml 校验未拒绝不兼容来源：$change" }
     }
     [IO.Directory]::CreateDirectory($flatDirectory) | Out-Null
-    foreach ($name in ($asrDlls + $llamaDlls + $sharedGgmlDlls)) {
+    Invoke-Expression (Get-Assignment $dist 'llamaRuntimeFiles')
+    foreach ($name in ($asrDlls + $llamaRuntimeFiles)) {
         Copy-Exclusive (Join-Path $nativeDirectory $name) (Join-Path $flatDirectory $name)
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $flatDirectory 'llama-server-impl.dll') -PathType Leaf) -or
+        @(Get-ChildItem -LiteralPath $flatDirectory -File -Recurse | Where-Object Extension -NE '.dll').Count) {
+        throw '进程内服务分发缺少实现动态库或混入了 EXE'
     }
     foreach ($name in $sharedGgmlDlls) {
         Assert-RecordedArtifact $flatDirectory $ggmlFiles $name
@@ -164,4 +190,4 @@ try {
     if ([IO.Directory]::Exists($nativeDirectory)) { [IO.Directory]::Delete($nativeDirectory) }
     [IO.Directory]::Delete($temporary)
 }
-Write-Output '分发布局自检通过：统一 ggml 身份和全套文件校验一致，拒绝不兼容来源与覆盖，共享库仅保留一份。'
+Write-Output '分发布局自检通过：服务 ABI 和动态库集合正确，无服务 EXE；统一 ggml 身份和全套文件校验一致，拒绝不兼容来源与覆盖，共享库仅保留一份。'

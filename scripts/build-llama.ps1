@@ -10,7 +10,7 @@ $ProgressPreference = 'SilentlyContinue'
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw '此构建需要 Windows x64 PowerShell。' }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $buildRoot = Join-Path $projectRoot '.tools/llama-build-cuda128'
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/llama-shared' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/llama-embedded' }
 $output = [IO.Path]::GetFullPath($OutputDirectory).TrimEnd('\','/')
 $downloads = Join-Path $buildRoot 'downloads'
 $source = Join-Path $buildRoot 'source'
@@ -139,6 +139,50 @@ $compatibilityText = $commit + "`nGGML_OPENMP=OFF`n" + (($patchRecords | ForEach
 $compatibilityHasher = [Security.Cryptography.SHA256]::Create()
 try { $compatibilityId = 'sha256:' + ([BitConverter]::ToString($compatibilityHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($compatibilityText)))).Replace('-','').ToLowerInvariant() } finally { $compatibilityHasher.Dispose() }
 
+# Keep the server-hosting changes outside the shared ggml compatibility identity.
+$embeddedPatch = Join-Path $projectRoot 'native/llama-server-embedded.patch'
+$embeddedNormalized = Join-Path $patchCache 'llama-server-embedded.patch'
+[IO.File]::WriteAllText($embeddedNormalized, [IO.File]::ReadAllText($embeddedPatch).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+if (-not (Test-Hash $embeddedNormalized '98405c2511eec7249a6284a3077a201901bec292875d70400db2745138a091c5')) { throw '嵌入式服务补丁校验失败，请检查 native/llama-server-embedded.patch。' }
+$embeddedSources = @(
+    @{ source='common/common.cpp'; original='f637dc38ab72bcdda4f845dda08fc6e621340d4ca7d749300053dc2f7184e95f'; result='a0ac1a2c6ab0ed60834ab68aaca76c346f42b0bdbf13fe82a5ad306787842fb1' },
+    @{ source='common/common.h'; original='27065aa3985e042427c07da8f984e4f59b92935c0569c5ef94eb4f5871d28e46'; result='05888403f43d90c62330f4990235cbea84d906ecd4231eafe8854f89233241b9' },
+    @{ source='src/llama.cpp'; original='0283e941ddd0ac3f8bc637a2e058336201bcd0784e1ebc697ea9bee3b2761bcd'; result='feb1a1f2638a950ebfc9796dc8dbf299c5425d0bca5685dbd615b80871c9ef6f' },
+    @{ source='src/llama-impl.cpp'; original='abd5851762a157ae477588537e0cfe8dddfa1d2a2efb596d17efa4a19b45c769'; result='291398a0723916c00949ef45ab8611d0bb9ce9db441a078416742ecf0623f68f' },
+    @{ source='tools/server/CMakeLists.txt'; original='1974622da49a72c8f9e244ad70d70c42a913ab390ef705985e7bdb763230e737'; result='11540ad497dc5e720dfb8697fd1539039465fcaf73e69dbb5a038a9cd05d5783' },
+    @{ source='tools/server/server-context.cpp'; original='26acff2657377779f0b48317c043c97b6e9022eaf89d8d956d8ae2a8b2e6e38d'; result='96a76d07af673216ac631f8d0a87ef1e07c0426361ee10f90ebc95e4e2e6fcaf' },
+    @{ source='tools/server/server-http.cpp'; original='aad15b757323f36b81235182c4a0a35d448399012ae3ef4fed9902b716fa17ea'; result='81c220f68e4cd724183450b444872f94996a1525c5dac3a13dd3508a3fd15aeb' },
+    @{ source='tools/server/server-http.h'; original='29c53f7ffde226edf3e6f48463e4807f7e554ca12e476099f90e0ff18142978d'; result='57d1d2fdd61d5683c1e0ef61d3bc2a884b8cc31a88b26dbc1e3dfceec607939c' },
+    @{ source='tools/server/server-queue.cpp'; original='65c4a0e8f95900e46f0e20e4f0dd156e34881cbd23615911e2de7777e90ad653'; result='282c0145891d11de2fb8d7a44ab72bdabec93675392a796aee67da2e59dbb44d' },
+    @{ source='tools/server/server-queue.h'; original='d77a3eac479e8ad772b325db643225ea3e68a9715709e375d859295c31161924'; result='a5158a47b5e22ff761fd6cd200a259b69ab7ec2ae8f67e9b30dcbd025b502a40' },
+    @{ source='tools/server/server.cpp'; original='d4d343db7c1b648eb5358ae2b87966a5f78ce5c9b245c7fbfe9827ba6971f08b'; result='be0bc275a4188be9f3d1a9bb793f3d557ff091b376902d063021d1f569cb5ab7' }
+)
+$embeddedNeedsPatch = $false
+$embeddedAlreadyPatched = $false
+foreach ($record in $embeddedSources) {
+    $path = Join-Path $source $record.source
+    $originalText = [IO.File]::ReadAllText($path)
+    $text = $originalText.Replace("`r`n", "`n")
+    if ($originalText -cne $text) { [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false)) }
+    if (Test-Hash $path $record.original) { $embeddedNeedsPatch = $true }
+    elseif (Test-Hash $path $record.result) { $embeddedAlreadyPatched = $true }
+    else { throw "嵌入式服务源码不匹配固定版本：$path；请恢复下载源码后重试。" }
+}
+if ($embeddedNeedsPatch -and $embeddedAlreadyPatched) { throw '嵌入式服务补丁只应用了部分文件，请恢复固定版本源码后重试。' }
+if ($embeddedNeedsPatch) {
+    & git -c core.autocrlf=false -C $projectRoot apply --check --directory=.tools/llama-build-cuda128/source $embeddedNormalized
+    if ($LASTEXITCODE -ne 0) { throw '嵌入式服务补丁不能应用，请恢复固定版本源码后重试。' }
+    & git -c core.autocrlf=false -C $projectRoot apply --directory=.tools/llama-build-cuda128/source $embeddedNormalized
+    if ($LASTEXITCODE -ne 0) { throw '嵌入式服务补丁应用失败，请恢复固定版本源码后重试。' }
+}
+foreach ($record in $embeddedSources) {
+    if (-not (Test-Hash (Join-Path $source $record.source) $record.result)) { throw "嵌入式服务补丁结果校验失败：$($record.source)" }
+}
+$embeddedExports = @('streamtrans_server_abi_version','streamtrans_server_create','streamtrans_server_run','streamtrans_server_request_stop','streamtrans_server_status','streamtrans_server_destroy')
+$embeddedBridgeFiles = @('native/streamtrans_llama_embedded.h','native/streamtrans_llama_embedded.inc') | ForEach-Object {
+    @{ name = $_; sha256 = (Get-FileHash -LiteralPath (Join-Path $projectRoot $_) -Algorithm SHA256).Hash.ToLowerInvariant() }
+}
+
 # Initialize only this process; do not install CUDA or change machine/user PATH.
 $vcvars = Join-Path $vs 'VC/Auxiliary/Build/vcvars64.bat'
 $envScript = Join-Path $buildRoot 'build-environment.cmd'
@@ -161,21 +205,57 @@ try {
     $env:CUDACXX = Join-Path $cuda 'bin/nvcc.exe'
     $env:VSLANG = '1033'
     $env:PATH = (Join-Path $cuda 'bin') + ';' + $env:PATH
+    # Some MSVC installations contain only the Chinese UI pack. VSLANG=1033
+    # then falls back, while CMake may misdecode /showIncludes and record no
+    # dependencies. Probe the actual bytes and preserve them for Ninja.
+    $includeProbe = Join-Path $buildRoot 'msvc-includes'
+    New-Item -ItemType Directory -Path $includeProbe -Force | Out-Null
+    $probeSource = Join-Path $includeProbe 'probe.c'
+    $probeOutput = Join-Path $includeProbe 'stdout.bin'
+    $probeCommand = Join-Path $includeProbe 'probe.cmd'
+    [IO.File]::WriteAllText($probeSource, '#include <stddef.h>', [Text.Encoding]::ASCII)
+    $cl = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/cl.exe'
+    [IO.File]::WriteAllLines($probeCommand, @('@echo off', ('"' + $cl + '" /nologo /showIncludes /c /Fo"' + (Join-Path $includeProbe 'probe.obj') + '" "' + $probeSource + '" >"' + $probeOutput + '" 2>&1')), [Text.Encoding]::Default)
+    & $env:ComSpec /d /c $probeCommand
+    if ($LASTEXITCODE -ne 0) { throw 'MSVC 头文件依赖探测失败，请检查 .tools/llama-build-cuda128/msvc-includes/stdout.bin。' }
+    $byteEncoding = [Text.Encoding]::GetEncoding(28591)
+    $rawOutput = $byteEncoding.GetString([IO.File]::ReadAllBytes($probeOutput))
+    $prefixMatch = [regex]::Match($rawOutput, '(?m)^([^\r\n]*?)(?=[A-Za-z]:[\\/][^\r\n]*[\\/]stddef\.h\r?$)')
+    if (-not $prefixMatch.Success -or -not $prefixMatch.Value) { throw '无法识别 MSVC 头文件依赖前缀，请检查编译器语言配置。' }
+    $includePrefixFile = Join-Path $includeProbe 'prefix.cmake'
+    [IO.File]::WriteAllBytes($includePrefixFile, $byteEncoding.GetBytes('set(CMAKE_CL_SHOWINCLUDES_PREFIX [==[' + $prefixMatch.Value + ']==])' + "`n"))
+    $includePrefixHash = (Get-FileHash -LiteralPath $includePrefixFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $includeDepsStamp = Join-Path $build '.streamtrans-embedded-header-deps'
+    $refreshEmbeddedConsumers = -not (Test-Path -LiteralPath $includeDepsStamp) -or ([string](Get-Content -LiteralPath $includeDepsStamp -Raw)).Trim() -ne $includePrefixHash
+    if ($refreshEmbeddedConsumers) {
+        # These are all common_params consumers. Never remove GGML/CUDA objects.
+        foreach ($relative in @('common','tools/mtmd','tools/server')) {
+            $consumer = Join-Path $build $relative
+            if (Test-Path -LiteralPath $consumer) {
+                Get-ChildItem -LiteralPath $consumer -Recurse -File -Filter '*.obj' | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
+            }
+        }
+    }
     $configuration = @(
         '-S', $source, '-B', $build, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$ninja",
         '-DCMAKE_BUILD_TYPE=Release', "-DCMAKE_CUDA_COMPILER=$env:CUDACXX", "-DCUDAToolkit_ROOT=$cuda",
+        "-DCMAKE_PROJECT_INCLUDE=$includePrefixFile",
         "-DCMAKE_CUDA_ARCHITECTURES=$architectures", '-DBUILD_SHARED_LIBS=ON',
         # The archive has no .git; prevent ggml from reporting the parent project's commit.
         '-DGIT_EXE:FILEPATH=OFF',
         '-DLLAMA_BUILD_NUMBER=11960', "-DLLAMA_BUILD_COMMIT=$commit", '-DLLAMA_BUILD_TESTS=OFF',
         '-DLLAMA_BUILD_EXAMPLES=OFF', '-DLLAMA_BUILD_TOOLS=ON', '-DLLAMA_BUILD_SERVER=ON',
         '-DLLAMA_BUILD_APP=OFF', '-DLLAMA_BUILD_UI=OFF', '-DLLAMA_USE_PREBUILT_UI=OFF', '-DLLAMA_OPENSSL=OFF',
+        "-DSTREAMTRANS_EMBEDDED_SOURCE_DIR=$(Join-Path $projectRoot 'native')",
         '-DGGML_NATIVE=OFF', '-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON',
         '-DGGML_CUDA=ON', '-DGGML_CUDA_COMPRESSION_MODE=size', '-DGGML_OPENMP=OFF', '-DGGML_OPENMP_FETCH=OFF'
     )
     Write-Host "正在配置 llama.cpp b11960 / CUDA 12.8 ($architectures)"
     Invoke-Cmake $configuration (Join-Path $buildRoot 'configure.log') 'CMake 配置失败，请查看 .tools/llama-build-cuda128/configure.log 并修复工具链后重试。'
-    Invoke-Cmake @('--build',$build,'--target','llama-server','--parallel',"$Jobs") (Join-Path $buildRoot 'build.log') 'llama-server 编译失败，请查看 .tools/llama-build-cuda128/build.log 并修复后重试。'
+    Invoke-Cmake @('--build',$build,'--target','llama-server-impl','--parallel',"$Jobs") (Join-Path $buildRoot 'build.log') 'llama-server-impl 编译失败，请查看 .tools/llama-build-cuda128/build.log 并修复后重试。'
+    $deps = & $ninja -C $build -t deps 'tools/server/CMakeFiles/llama-server-impl.dir/server.cpp.obj'
+    if ($LASTEXITCODE -ne 0 -or -not @($deps | Where-Object { $_ -match '[\\/]common[\\/]common\.h\s*$' }).Count) { throw 'Ninja 未记录 common.h 依赖，请检查 MSVC /showIncludes 前缀后重试。' }
+    Set-Content -LiteralPath $includeDepsStamp -Value $includePrefixHash -Encoding ascii
 
     $bin = Join-Path $build 'bin'
     $serverDlls = @('llama-server-impl.dll','llama-common.dll','llama.dll','mtmd.dll','ggml.dll','ggml-base.dll','ggml-cuda.dll')
@@ -186,7 +266,8 @@ try {
             throw "输出目录中存在无关程序或运行库，请改用干净的输出目录：$($native.FullName)"
         }
     }
-    Copy-Item -LiteralPath (Join-Path $bin 'llama-server.exe') -Destination $output -Force
+    $oldServerExe = Join-Path $output 'llama-server.exe'
+    if (Test-Path -LiteralPath $oldServerExe -PathType Leaf) { Remove-Item -LiteralPath $oldServerExe }
     foreach ($dll in $serverDlls) { Copy-Item -LiteralPath (Join-Path $bin $dll) -Destination $output -Force }
     $licenses = Join-Path $output 'licenses'
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
@@ -233,10 +314,15 @@ try {
         $candidate = Join-Path $output $name
         if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and -not $checked.ContainsKey($candidate)) { Remove-Item -LiteralPath $candidate }
     }
-    foreach ($required in @('llama-server.exe','llama-server-impl.dll','llama.dll','ggml.dll','ggml-base.dll','ggml-cuda.dll')) {
+    foreach ($required in @('llama-server-impl.dll','llama.dll','ggml.dll','ggml-base.dll','ggml-cuda.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $output $required) -PathType Leaf)) { throw "缺少构建产物：$required" }
     }
     if (-not @(Get-ChildItem -LiteralPath $output -File -Filter 'ggml-cpu*.dll').Count) { throw '构建产物缺少 CPU 后端。' }
+    $exports = & $dumpbin /nologo /exports (Join-Path $output 'llama-server-impl.dll')
+    if ($LASTEXITCODE -ne 0) { throw '无法读取嵌入式服务 DLL 导出表。' }
+    foreach ($symbol in $embeddedExports) {
+        if (-not @($exports | Where-Object { $_ -match ('\s' + [regex]::Escape($symbol) + '\s*$') }).Count) { throw "构建产物缺少嵌入式服务导出：$symbol" }
+    }
     $buildInfo = Get-Content -LiteralPath (Join-Path $build 'common/build-info.cpp') -Raw
     if ($buildInfo -notmatch 'LLAMA_BUILD_NUMBER = 11960;' -or -not $buildInfo.Contains('LLAMA_COMMIT = "' + $commit + '"')) {
         throw '生成的构建版本不匹配固定 b11960 commit，请检查 CMake 配置。'
@@ -258,9 +344,11 @@ try {
         source_tree_sha256 = $sourceTreeHash; nvcc_sha256 = (Get-FileHash -LiteralPath $env:CUDACXX -Algorithm SHA256).Hash.ToLowerInvariant()
         source_directory = $source; build_directory = $build
         ggml = @{ commit = $commit; compatibility_id = $compatibilityId; cpu_openmp = $false; patches = $patchRecords; files = $ggmlFiles }
+        embedded_server = @{ abi_version = 1; library = 'llama-server-impl.dll'; exports = $embeddedExports; patch = @{ name = 'native/llama-server-embedded.patch'; sha256 = (Get-FileHash -LiteralPath $embeddedNormalized -Algorithm SHA256).Hash.ToLowerInvariant(); sources = $embeddedSources }; bridge_files = @($embeddedBridgeFiles) }
         cmake_arguments = $configuration
+        msvc_header_dependencies = @{ prefix_sha256 = $includePrefixHash; server_common_header_verified = $true }
         cuda_architectures = $architectures.Split(';'); cuda_compression = 'size'; cpu_all_variants = $true; cpu_openmp = $false
-        ui = $false; openssl = $false; target = 'llama-server'; packages = $packages; files = $files
+        ui = $false; openssl = $false; target = 'llama-server-impl'; packages = $packages; files = $files
     } | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $manifestPath -Encoding utf8
     Write-Host "已构建 llama.cpp b11960 / CUDA 12.8：$output"
 } finally {

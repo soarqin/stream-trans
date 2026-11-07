@@ -3,6 +3,9 @@
 
 #[path = "../src/asr.rs"]
 mod asr;
+#[cfg(windows)]
+#[path = "../src/native_library.rs"]
+mod native_library;
 #[path = "../src/vad.rs"]
 #[allow(dead_code)]
 mod vad;

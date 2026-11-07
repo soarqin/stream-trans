@@ -11,7 +11,7 @@ $ProgressPreference = 'SilentlyContinue'
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw '此构建需要 Windows x64 PowerShell。' }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $buildRoot = Join-Path $projectRoot '.tools/transcribe-build-shared'
-if (-not $LlamaDirectory) { $LlamaDirectory = Join-Path $projectRoot '.tools/llama-shared' }
+if (-not $LlamaDirectory) { $LlamaDirectory = Join-Path $projectRoot '.tools/llama-embedded' }
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot '.tools/transcribe-shared' }
 $llama = [IO.Path]::GetFullPath($LlamaDirectory).TrimEnd('\','/')
 $output = [IO.Path]::GetFullPath($OutputDirectory).TrimEnd('\','/')

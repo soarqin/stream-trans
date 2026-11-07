@@ -1,0 +1,301 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 221f089..3412c11 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1750,6 +1750,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
+                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+     cparams.embeddings        = params.embedding;
++    cparams.abort_callback    = params.abort_callback;
++    cparams.abort_callback_data = params.abort_callback_data;
+     cparams.rope_scaling_type = params.rope_scaling_type;
+     cparams.rope_freq_base    = params.rope_freq_base;
+     cparams.rope_freq_scale   = params.rope_freq_scale;
+diff --git a/common/common.h b/common/common.h
+index cd89a27..804df91 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -769,6 +769,10 @@ struct common_params {
+     llama_progress_callback load_progress_callback = NULL;
+     void *                  load_progress_callback_user_data = NULL;
+     bool no_alloc = false; // Don't allocate model buffers
++    // StreamTrans embedded host: bypass process-global/environment integration.
++    bool embedded_host = false;
++    ggml_abort_callback abort_callback = nullptr;
++    void * abort_callback_data = nullptr;
+ 
+     // TTS params
+     std::string tts_lang = "";
+diff --git a/src/llama-impl.cpp b/src/llama-impl.cpp
+index 4ca836c..4fe595c 100644
+--- a/src/llama-impl.cpp
++++ b/src/llama-impl.cpp
+@@ -12,8 +12,16 @@
+ #include <cstring>
+ #include <vector>
+ 
++// The embedded host owns logging. Keep llama's initial sink quiet without
++// replacing the shared ggml/ASR callback or touching process standard streams.
++static void streamtrans_llama_log_callback(ggml_log_level level, const char * text, void * user_data) {
++    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
++        llama_log_callback_default(level, text, user_data);
++    }
++}
++
+ struct llama_logger_state {
+-    ggml_log_callback log_callback = llama_log_callback_default;
++    ggml_log_callback log_callback = streamtrans_llama_log_callback;
+     void * log_callback_user_data = nullptr;
+ };
+ 
+@@ -58,6 +66,10 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
+ }
+ 
+ static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
++    if (g_logger_state.log_callback == streamtrans_llama_log_callback &&
++            level != GGML_LOG_LEVEL_WARN && level != GGML_LOG_LEVEL_ERROR) {
++        return;
++    }
+     va_list args_copy;
+     va_copy(args_copy, args);
+     char buffer[128];
+diff --git a/src/llama.cpp b/src/llama.cpp
+index e3699ea..e0e6b3f 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -119,6 +119,19 @@ const char * llama_version(void) {
+     return LLAMA_VERSION;
+ }
+ 
++// Private fixed-version C bridge used only by StreamTrans's embedded server.
++extern "C" LLAMA_API int32_t streamtrans_llama_gpu_layers(
++        const llama_model * model, ggml_backend_dev_t device, uint32_t * total) {
++    if (!model || !device || !total) { return -1; }
++    const int32_t layers = llama_model_n_layer(model);
++    *total = layers + 1;
++    int32_t count = model->dev_output() == device ? 1 : 0;
++    for (int32_t i = 0; i < layers; ++i) {
++        count += model->dev_layer(i) == device ? 1 : 0;
++    }
++    return count;
++}
++
+ void llama_backend_init(void) {
+     ggml_time_init();
+ 
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 4f3fa24..3ada3c7 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -53,6 +53,14 @@ add_library(${TARGET}
+     server-models-sched.h
+ )
+ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
++if (STREAMTRANS_EMBEDDED_SOURCE_DIR)
++    target_compile_definitions(${TARGET} PRIVATE STREAMTRANS_EMBEDDED_SERVER=1)
++    target_include_directories(${TARGET} PRIVATE ${STREAMTRANS_EMBEDDED_SOURCE_DIR})
++    # Explicit dependencies also work with localized MSVC /showIncludes output.
++    set_property(SOURCE server.cpp APPEND PROPERTY OBJECT_DEPENDS
++        "${STREAMTRANS_EMBEDDED_SOURCE_DIR}/streamtrans_llama_embedded.inc"
++        "${STREAMTRANS_EMBEDDED_SOURCE_DIR}/streamtrans_llama_embedded.h")
++endif()
+ 
+ target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 2bd1ab9..6b89f40 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1171,11 +1171,17 @@ private:
+         std::string stage;
+         std::vector<std::string> stages;
+         int64_t t_last_load_progress_ms = 0;
++        llama_progress_callback caller_callback = nullptr;
++        void * caller_data = nullptr;
+         load_progress_data(server_context_impl * ctx, const std::string & stage) : ctx(ctx), stage(stage) {}
+     };
+     static bool load_progress_callback(float progress, void * user_data) {
+         auto * d = static_cast<load_progress_data *>(user_data);
+         GGML_ASSERT(d);
++        // Keep caller cancellation when wrapping progress for server status.
++        if (d->caller_callback && !d->caller_callback(progress, d->caller_data)) {
++            return false;
++        }
+         // always emit the first and final sample; throttle the rest to one per 200ms
+         {
+             auto & t_last = d->t_last_load_progress_ms;
+@@ -1207,6 +1213,8 @@ private:
+ 
+         const bool is_resume = sleeping;
+ 
++        load_progress_text.caller_callback = params.load_progress_callback;
++        load_progress_text.caller_data = params.load_progress_callback_user_data;
+         params_base = params;
+         const auto output_limits = server_output_limits(params_base);
+         params_base.n_outputs_max = output_limits.total;
+diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
+index cf147c7..bb38bd9 100644
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -24,6 +24,8 @@ public:
+     std::vector<std::thread> threads; // one thread per listener
+     std::unique_ptr<httplib::ThreadPool> pool; // single pool shared among all listeners
+     int n_threads_http = 0;
++    bool embedded_host = false;
++    std::atomic<bool> stopping{false};
+ };
+ 
+ class server_http_task_queue : public httplib::TaskQueue {
+@@ -89,7 +91,8 @@ struct gcp_params {
+     int port;
+ 
+     // Ref: https://docs.cloud.google.com/vertex-ai/docs/predictions/custom-container-requirements#aip-variables
+-    gcp_params() {
++    explicit gcp_params(bool embedded = false) : enabled(false), port(8080) {
++        if (embedded) { return; }
+         enabled = getenv("AIP_MODE", "") == "PREDICTION";
+         path_health = getenv("AIP_HEALTH_ROUTE", "", true); // default: using the route defined in server.cpp
+         path_predict = getenv("AIP_PREDICT_ROUTE", "/predict", true);
+@@ -110,7 +113,8 @@ struct gcp_params {
+ };
+ 
+ bool server_http_context::init(const common_params & params) {
+-    const gcp_params gcp;
++    pimpl->embedded_host = params.embedded_host;
++    const gcp_params gcp(pimpl->embedded_host);
+ 
+     path_prefix = params.api_prefix;
+     port = params.port;
+@@ -547,6 +551,7 @@ bool server_http_context::start() {
+ }
+ 
+ void server_http_context::stop() const {
++    pimpl->stopping.store(true);
+     for (const auto & srv : pimpl->servers) {
+         if (srv) {
+             srv->stop();
+@@ -675,7 +680,7 @@ static void process_handler_response(server_http_req_ptr && request, server_http
+ 
+ void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
+     handlers.emplace(path, handler);
+-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
++    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
+             get_params(req),
+             get_headers(req),
+@@ -683,7 +688,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
+             build_query_string(req),
+             req.body,
+             {},
+-            req.is_connection_closed
++            [this, closed = req.is_connection_closed]() { return pimpl->stopping.load() || closed(); }
+         });
+         server_http_res_ptr response = handler(*request);
+         process_handler_response(std::move(request), response, res);
+@@ -696,7 +701,7 @@ void server_http_context::get(const std::string & path, const server_http_contex
+ 
+ void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
+     handlers.emplace(path, handler);
+-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
++    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+         std::string body = req.body;
+         std::map<std::string, uploaded_file> files;
+ 
+@@ -734,7 +739,7 @@ void server_http_context::post(const std::string & path, const server_http_conte
+             build_query_string(req),
+             body,
+             std::move(files),
+-            req.is_connection_closed
++            [this, closed = req.is_connection_closed]() { return pimpl->stopping.load() || closed(); }
+         });
+         server_http_res_ptr response = handler(*request);
+         process_handler_response(std::move(request), response, res);
+@@ -797,7 +802,7 @@ void server_http_context::ws(const std::string & path, const server_http_context
+ 
+ void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
+     handlers.emplace(path, handler);
+-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
++    auto callback = [this, handler](const httplib::Request & req, httplib::Response & res) {
+         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
+             get_params(req),
+             get_headers(req),
+@@ -805,7 +810,7 @@ void server_http_context::del(const std::string & path, const server_http_contex
+             build_query_string(req),
+             req.body,
+             {},
+-            req.is_connection_closed
++            [this, closed = req.is_connection_closed]() { return pimpl->stopping.load() || closed(); }
+         });
+         server_http_res_ptr response = handler(*request);
+         process_handler_response(std::move(request), response, res);
+@@ -863,7 +868,7 @@ static json parse_gcp_predict_response(const server_http_res_ptr & res) {
+ }
+ 
+ void server_http_context::register_gcp_compat() const {
+-    const gcp_params gcp;
++    const gcp_params gcp(pimpl->embedded_host);
+ 
+     if (!gcp.enabled) {
+         // do nothing
+diff --git a/tools/server/server-http.h b/tools/server/server-http.h
+index d123535..7845a11 100644
+--- a/tools/server/server-http.h
++++ b/tools/server/server-http.h
+@@ -53,7 +53,7 @@ struct server_http_req {
+     std::string query_string; // query parameters string (e.g. "action=save")
+     std::string body;
+     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
+-    const std::function<bool()> & should_stop;
++    std::function<bool()> should_stop;
+ 
+     std::string get_param(const std::string & key, const std::string & def = "") const {
+         auto it = params.find(key);
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index c4ce907..ea64ceb 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -132,6 +132,7 @@ void server_queue::wait_until_no_sleep() {
+ void server_queue::terminate() {
+     std::unique_lock<std::mutex> lock(mutex_tasks);
+     running = false;
++    terminated = true;
+     condition_tasks.notify_all();
+ }
+ 
+@@ -276,7 +277,11 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
+ }
+ 
+ void server_queue::start_loop(int64_t idle_sleep_ms) {
+-    running = true;
++    {
++        std::lock_guard<std::mutex> lock(mutex_tasks);
++        if (terminated) { return; }
++        running = true;
++    }
+     time_last_task = ggml_time_ms();
+ 
+     // spawn the worker thread used by yield_to_queue()
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index 692255e..18b8688 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -16,6 +16,7 @@ struct server_queue {
+ private:
+     int id = 0;
+     bool running  = false;
++    bool terminated = false; // Sticky: stop during loading must survive start_loop().
+     bool sleeping = false;
+     bool req_stop_sleeping = false;
+     int64_t time_last_task = 0;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 8b1d426..ed1e02e 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -811,3 +811,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     server_role role;
+     return server_run(params, argc, argv, role, opts);
+ }
++
++#if defined(STREAMTRANS_EMBEDDED_SERVER)
++#include "streamtrans_llama_embedded.inc"
++#endif

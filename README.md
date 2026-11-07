@@ -2,7 +2,9 @@
 
 本地 Rust 服务：音频 → FSMN-VAD 断句 → Fun-ASR-Nano-2512 识别 → 可选 Hy-MT2-1.8B 翻译。支持文件上传和 WebSocket 连续音频输入，返回原文、可选译文及语音段时间范围。另提供 Rust 桌面录音客户端，内含网页输出和可编辑 CSS；客户端无需运行 VAD，服务端负责归并音频和断句。
 
-项目不依赖 Python 或 PyTorch 运行环境。ASR 使用 Rust 调用 transcribe.cpp 原生 CUDA 库，LLM 使用随程序分发的 llama.cpp CUDA 后端，FSMN-VAD 使用 Rust Candle 在 CPU 上运行。Rust 服务自动管理本机 `llama-server` 子进程，无须另外部署模型服务。FFmpeg 用于音频格式转换。
+项目不依赖 Python 或 PyTorch 运行环境。ASR 使用 Rust 调用 transcribe.cpp 原生 CUDA 库，LLM 使用随程序分发的 llama.cpp CUDA 后端，FSMN-VAD 使用 Rust Candle 在 CPU 上运行。Windows 在 Rust 服务进程内加载 `llama-server-impl.dll`，无须另外部署模型服务或启动 `llama-server.exe`；Linux 保留托管 `llama-server` 子进程。FFmpeg 用于音频格式转换。
+
+Windows 使用固定构建的进程内 C ABI，并在模型加载前配置 CUDA Spin 等待以降低响应延迟；等待 GPU 时会增加 CPU 占用。分发方式、性能对照和取消边界见 [进程内 llama.cpp 验证](docs/embedded-llama-20261107.md)。
 
 | 用途 | 模型 | 执行方式 |
 | --- | --- | --- |
@@ -16,7 +18,7 @@ ASR 和 LLM 必须运行在 GPU 上，不自动回退 CPU。Windows 分发包包
 
 Windows 分发目录将 ASR、llama.cpp、唯一一套 ggml、CUDA 12.8 运行库和 FFmpeg 解码 DLL 全部放在 `runtime` 根目录。ggml 使用 llama.cpp b11960 随附的 0.28 源码并应用 transcribe 兼容补丁；transcribe.cpp 0.4.1 使用同一套头文件和库重新编译，使 ASR 与 LLM 共用 `ggml.dll`、`ggml-base.dll`、`ggml-cuda.dll` 和 CPU 后端。原预编译 ASR 的 ggml 0.26 不能直接与 0.28 混用。文件上传在进程内解码，不启动 FFmpeg 子进程；实时录音直接传输 PCM，不经过 FFmpeg。
 
-当前统一 ggml 的构建与验证记录见 [共享 ggml 验证](docs/shared-ggml-20261107.md)。此前仅共享 CUDA 并改用 FFmpeg DLL 的 [共享运行库验证](docs/shared-runtime-20261107.md) 保留为历史记录，其中的包体积与性能数字不代表当前统一 ggml 构建。
+此前统一 ggml、仍使用 llama-server 子进程的构建验证见 [共享 ggml 验证](docs/shared-ggml-20261107.md)。更早仅共享 CUDA 并改用 FFmpeg DLL 的 [共享运行库验证](docs/shared-runtime-20261107.md) 也保留为历史记录；这些报告中的双进程、包体积和性能数字不代表当前进程内构建。
 
 ## Windows 安装与启动
 
@@ -35,7 +37,7 @@ powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
 
 Windows 安装通过 `scripts/setup-cuda-runtime.ps1` 准备 CUDART 12.8.90 和 cuBLAS 12.8.4.1，复用下载缓存。两个开发目录保留同源依赖副本，制作分发目录时只携带一套 ggml 和 CUDA DLL。打包会交叉核对 ggml 源码提交、兼容补丁标识和完整文件 SHA256，拒绝混合旧库。CUDA Toolkit 和 NVCC 只用于构建机器，不进入分发目录；仓库只保留源码、兼容补丁和构建脚本，不提交下载缓存或编译产物。
 
-单独构建 llama.cpp 可运行 `scripts/setup-llama.ps1 -Jobs 4`，默认输出到 `.tools/llama-shared`。随后运行 `scripts/build-asr.ps1 -Jobs 4`，默认从该目录复用 ggml，ASR 输出到 `.tools/transcribe-shared`。两个脚本均支持 `-OutputDirectory`；ASR 的 `-LlamaDirectory` 可指定配套 llama 构建。
+单独构建 llama.cpp 可运行 `scripts/setup-llama.ps1 -Jobs 4`，默认输出到 `.tools/llama-embedded`。构建会加入项目的进程内服务 C ABI。随后运行 `scripts/build-asr.ps1 -Jobs 4`，默认从该目录复用 ggml，ASR 输出到 `.tools/transcribe-shared`。两个脚本均支持 `-OutputDirectory`；ASR 的 `-LlamaDirectory` 可指定配套 llama 构建。
 
 重新构建或运行检查：
 
@@ -52,7 +54,7 @@ cargo fmt --check
 .\target\release\streamtrans.exe --gpu 0 --ffmpeg-library .tools/ffmpeg-shared/bin/streamtrans-ffmpeg.dll
 ```
 
-`--llama-server` 和 `--asr-library` 可覆盖默认原生程序路径。发行模式自动查找可执行文件旁的 `runtime` 目录；部署时复制完整分发目录，无须在运行机器安装 Rust、C++ 编译器、CUDA Toolkit 或 Python：
+Windows 使用 `--llama-library` 和 `--asr-library` 覆盖默认原生库路径；开发模式的翻译库默认为 `.tools/llama-embedded/llama-server-impl.dll`。发行模式自动查找可执行文件旁的 `runtime` 目录；部署时复制完整分发目录，无须在运行机器安装 Rust、C++ 编译器、CUDA Toolkit 或 Python：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/dist.ps1
@@ -223,13 +225,13 @@ Hy-MT2-1.8B Q6_K 基于官方翻译模板，追加逐句完整翻译、保留数
 
 完整表启动时加载一次，全部语言、全部条目按模型推荐的「原词翻译成指定译法」句式编码为同一条 user 消息的固定前缀，并使用完整中文语言标签；不是将原始 TSV 原样放入提示，也不按当前原文筛词。每次翻译明确当前目标语言，只编码变化后缀，复用 llama.cpp 的前缀 KV；客户端无需发送术语表。默认 `--glossary-max-tokens 1024` 检查规范化后的完整 TSV token 数，实际渲染前缀另查上下文容量，超限明确拒绝，不自动截断。上下文还需容纳原文和完整输出预算。
 
-本机 llama-server API 仍接收完整拼接 token ID 序列，KV 缓存减少重复计算，不代表网络零重传或无限容量。未加载术语表时保持 `cache_prompt=false`。术语遵从不是硬约束：例如日语译文仍可能混入只为英语指定的 `on-device`，目标语言隔离仍有限制。格式、部署和实际缓存命中见 [术语表说明](docs/glossary.md)。
+本机 llama.cpp HTTP API 仍接收完整拼接 token ID 序列；Windows 的 HTTP 服务运行在主进程内。KV 缓存减少重复计算，不代表请求体零重传或无限容量。未加载术语表时保持 `cache_prompt=false`。术语遵从不是硬约束：例如日语译文仍可能混入只为英语指定的 `on-device`，目标语言隔离仍有限制。格式、部署和实际缓存命中见 [术语表说明](docs/glossary.md)。
 
-`--inference-timeout-seconds` 默认 300 秒。ASR 使用原生取消回调；LLM 通过托管子进程的本地接口执行翻译。LLM 请求超时或通信失败时，服务先停止并回收子进程，再返回错误，避免超时后继续占用 GPU；此时需要重启 StreamTrans。其他后端错误可通过 `GET /health` 检查状态。
+`--inference-timeout-seconds` 默认 300 秒。ASR 使用原生取消回调；LLM 通过本机 HTTP 接口执行翻译。LLM 请求超时或通信失败时，Windows 请求停止原生服务并等待推理线程退出，Linux 停止并回收托管子进程，然后返回错误；此时需要重启 StreamTrans。Windows 的取消需要等待正在执行的 GPU 运算结束，不能强制中断任意 CUDA 内核。其他后端错误可通过 `GET /health` 检查状态。
 
-`--startup-timeout-seconds` 限制启动等待时间，但 Rust 转换和原生模型加载不能被强制中断；发生超时或在加载期间退出时，进程仍会等待当前阻塞任务完成。
+`--startup-timeout-seconds` 限制启动等待时间。Windows 翻译库支持在模型加载进度点检查取消；Rust 转换及正在执行的原生操作仍不能被强制中断，发生超时或在加载期间退出时，进程需要等待当前阻塞阶段结束。
 
-`GET /health` 检查原生模型状态。服务在所有模型加载完成并确认 ASR、LLM 使用 CUDA 后才开始监听。托管的 `llama-server` 仅监听 `127.0.0.1` 的临时端口，使用每次启动生成的 API 密钥，随服务退出清理。文件上传接口完成后统一返回 JSON，`segments` 包含各段原文，`translation` 对应合并后的全文。连续录音使用下述 WebSocket 接口；麦克风采集由客户端完成。
+`GET /health` 检查原生模型状态。服务在所有模型加载完成并确认 ASR、LLM 使用 CUDA 后才开始监听。内部 llama.cpp HTTP 服务仅监听 `127.0.0.1` 的临时端口，使用每次启动生成的 API 密钥；Windows 随服务停止并释放模型，Linux 随服务退出清理子进程。文件上传接口完成后统一返回 JSON，`segments` 包含各段原文，`translation` 对应合并后的全文。连续录音使用下述 WebSocket 接口；麦克风采集由客户端完成。
 
 ## 实时录音接口
 

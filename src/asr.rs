@@ -3,6 +3,7 @@ use std::{
     mem::{self, MaybeUninit},
     path::Path,
     ptr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -62,7 +63,7 @@ struct RunParams {
 }
 
 struct Api {
-    _library: Library,
+    _library: Arc<Library>,
     status: unsafe extern "C" fn(i32) -> *const c_char,
     load_init: unsafe extern "C" fn(*mut LoadParams),
     session_init_params: unsafe extern "C" fn(*mut SessionParams),
@@ -79,8 +80,6 @@ struct Api {
 
 pub struct Asr {
     api: Api,
-    #[cfg(windows)]
-    _dll_directories: Vec<DllDirectory>,
     model: Handle,
     session: Handle,
 }
@@ -98,22 +97,13 @@ impl Asr {
             )
         })?;
         #[cfg(windows)]
-        let dll_directories = dll_search_directories(&library_path)
-            .into_iter()
-            .map(|path| DllDirectory::add(&path))
-            .collect::<Result<Vec<_>>>()?;
-        #[cfg(windows)]
-        let library = unsafe {
-            libloading::os::windows::Library::load_with_flags(
-                &library_path,
-                0x00000100 | 0x00001000,
-            )
-            .map(Library::from)
-        }
-        .context("无法加载 transcribe 原生库，请先运行安装脚本")?;
-        #[cfg(not(windows))]
-        let library = unsafe { Library::new(&library_path) }
+        let library = crate::native_library::load(&library_path)
             .context("无法加载 transcribe 原生库，请先运行安装脚本")?;
+        #[cfg(not(windows))]
+        let library = Arc::new(
+            unsafe { Library::new(&library_path) }
+                .context("无法加载 transcribe 原生库，请先运行安装脚本")?,
+        );
         unsafe {
             let version =
                 *library.get::<unsafe extern "C" fn() -> *const c_char>(b"transcribe_version\0")?;
@@ -156,6 +146,8 @@ impl Asr {
             let init_params = *library.get::<unsafe extern "C" fn(*mut BackendParams)>(
                 b"transcribe_backend_init_params_init\0",
             )?;
+            #[cfg(windows)]
+            crate::native_library::configure_cuda(&library_path, gpu.try_into()?)?;
             let init_backends = *library.get::<unsafe extern "C" fn(*const BackendParams) -> i32>(
                 b"transcribe_init_backends_ex\0",
             )?;
@@ -219,8 +211,6 @@ impl Asr {
             params.device = device;
             let mut asr = Self {
                 api,
-                #[cfg(windows)]
-                _dll_directories: dll_directories,
                 model: ptr::null_mut(),
                 session: ptr::null_mut(),
             };
@@ -317,76 +307,4 @@ impl Drop for Asr {
 
 fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.to_str().context("路径必须为有效 UTF-8")?).context("路径包含 NUL 字符")
-}
-
-#[cfg(any(windows, test))]
-fn dll_search_directories(library: &Path) -> Vec<std::path::PathBuf> {
-    let directory = library
-        .parent()
-        .expect("canonical library path has a parent");
-    let mut directories = vec![directory.to_owned()];
-    if let Some(shared) = directory
-        .parent()
-        .filter(|path| path.join("cudart64_12.dll").is_file())
-    {
-        directories.push(shared.to_owned());
-    }
-    directories
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shared_cuda_search_keeps_backend_libraries_isolated() -> Result<()> {
-        let temporary = tempfile::tempdir()?;
-        let runtime = temporary.path().join("runtime");
-        let asr = runtime.join("asr");
-        std::fs::create_dir_all(&asr)?;
-        let library = asr.join("transcribe.dll");
-        assert_eq!(dll_search_directories(&library), std::slice::from_ref(&asr));
-        std::fs::write(runtime.join("cudart64_12.dll"), [])?;
-        assert_eq!(dll_search_directories(&library), [asr, runtime]);
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-struct DllDirectory(Handle);
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn SetDefaultDllDirectories(flags: u32) -> i32;
-    fn AddDllDirectory(path: *const u16) -> Handle;
-    fn RemoveDllDirectory(cookie: Handle) -> i32;
-}
-
-#[cfg(windows)]
-impl DllDirectory {
-    fn add(path: &Path) -> Result<Self> {
-        use std::os::windows::ffi::OsStrExt;
-        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // ggml loads its CUDA plugin itself; its dependent DLLs need the registered directory.
-        unsafe {
-            if SetDefaultDllDirectories(0x00001000) == 0 {
-                return Err(std::io::Error::last_os_error()).context("无法设置 ASR DLL 搜索方式");
-            }
-            let cookie = AddDllDirectory(path.as_ptr());
-            if cookie.is_null() {
-                return Err(std::io::Error::last_os_error()).context("无法注册 ASR DLL 目录");
-            }
-            Ok(Self(cookie))
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for DllDirectory {
-    fn drop(&mut self) {
-        unsafe {
-            RemoveDllDirectory(self.0);
-        }
-    }
 }

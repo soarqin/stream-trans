@@ -1,6 +1,6 @@
 # 本地模型与原生 GPU 环境
 
-StreamTrans 使用 Rust 提供 HTTP 接口、下载模型、转换权重和调度推理。ASR 通过 transcribe.cpp C API 在 CUDA 上运行；文本翻译通过随包分发的 llama.cpp 在 CUDA 上运行；FSMN-VAD 通过 Rust Candle 在 CPU 上运行。运行时无需 Python 或 PyTorch 环境。Rust 自动启动和清理本机 `llama-server` 子进程，无须另行部署模型服务。ASR 原生库、llama.cpp、CUDA 运行库和 FFmpeg 均属于运行依赖，Windows 分发包会一并携带。
+StreamTrans 使用 Rust 提供 HTTP 接口、下载模型、转换权重和调度推理。ASR 通过 transcribe.cpp C API 在 CUDA 上运行；文本翻译通过随包分发的 llama.cpp 在 CUDA 上运行；FSMN-VAD 通过 Rust Candle 在 CPU 上运行。运行时无需 Python 或 PyTorch 环境。Windows 在主进程内调用 `llama-server-impl.dll` 的项目 C ABI，Linux 由 Rust 自动启动和清理本机 `llama-server` 子进程，无须另行部署模型服务。ASR 原生库、llama.cpp、CUDA 运行库和 FFmpeg 均属于运行依赖，Windows 分发包会一并携带。
 
 ## 固定模型版本
 
@@ -73,7 +73,7 @@ ASR 原生库明确选择 CUDA 后端，服务检查实际模型后端，不自�
 | Windows x64 CUDA | 固定提交 `4d7c1ccefd39e5a9ea36cca5f8fefc6dcc14b99b` 的源码归档 | `77bfafa35bd7eee447ec37b832e99c342c62b7db0c6cb18c36e763563b586b1f` |
 | Linux x86_64 CUDA | `transcribe-native-0.4.1-linux-x86_64-cuda.tar.gz` | `c4bdf9c4798bac1868ecdcaa04f27eb7712fb43125268313ce14d508c70d247d` |
 
-## Hy-MT2 量化推理与托管子进程
+## Hy-MT2 量化推理与本机服务
 
 项目使用固定版本的 [llama.cpp b11960](https://github.com/ggml-org/llama.cpp/releases/tag/b11960)，直接加载所选来源官方仓库中的 `Hy-MT2-1.8B-Q6_K.gguf`，保留原始量化权重。所有模型层加载到 CUDA；llama.cpp 负责分词、模型计算和采样，Rust 负责请求调度与结果检查，不需要 Python 推理环境。
 
@@ -87,11 +87,11 @@ d98fe604dec1f28f58f80d7d560f7177e584d3b8e5835862687660e5ff97cb40
 
 生产默认使用官方 1.8B 推荐采样值 `temperature=0.7`、`top_p=0.6`、`top_k=20`、重复惩罚 `1.05`；项目固定 `seed=42`。`min_p=0.0`，presence 与 frequency 惩罚为 `0.0`。模型直接生成译文，不提供思考模式开关；没有译文、未返回正常结束标记或生成耗尽预算时返回错误。官方模板与参数见 [Hy-MT2-1.8B-GGUF 模型卡](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF#inference-and-deployment)。
 
-`llama-server` 由 Rust 启动，绑定 `127.0.0.1` 的临时端口，使用启动时生成的 API 密钥。服务加载模型并检查 CUDA 后端后，再开放 StreamTrans 音频接口。子进程退出后，健康检查将报告后端不可用；StreamTrans 退出时清理托管子进程。该接口仅供 Rust 主进程调用，不作为外部模型 API 分发。
+llama.cpp HTTP 服务由 Rust 管理，绑定 `127.0.0.1` 的临时端口，使用启动时生成的 API 密钥。Windows 通过固定 C ABI 在主进程的原生线程内运行服务，直接构造模型参数，不调用 CLI 入口或接管进程信号；Linux 保留 `llama-server` 子进程。服务加载模型并检查 CUDA 后端后，再开放 StreamTrans 音频接口。原生服务停止后，健康检查将报告后端不可用。该接口仅供 Rust 调度翻译，不作为外部模型 API 分发。
 
-`--llama-server` 可指定可执行文件。Windows 开发模式默认使用 `.tools/llama-shared/llama-server.exe`，发行模式优先使用可执行文件旁的 `runtime/llama-server.exe`，仍可发现旧的 `runtime/llama/llama-server.exe` 路径。默认 `--context-size 4096`、`--max-tokens 2048`，输出预算用于译文。当前服务的参数范围不代表原模型完整的上下文能力。
+Windows 用 `--llama-library` 指定带项目 C ABI 的原生库。开发模式默认使用 `.tools/llama-embedded/llama-server-impl.dll`，发行模式优先使用可执行文件旁的 `runtime/llama-server-impl.dll`。官方原版或旧构建缺少嵌入入口，不能直接替换；运行安装脚本重新构建。Linux 用 `--llama-server` 指定可执行文件。默认 `--context-size 4096`、`--max-tokens 2048`，输出预算用于译文。当前服务的参数范围不代表原模型完整的上下文能力。
 
-生产子进程使用 FP16 KV 缓存，FlashAttention 由 llama.cpp 自动选择。未加载术语表时使用 `cache_prompt=false`；加载术语表时，启动只读入一次完整 canonical TSV，再将所有语言的全部条目按官方推荐的逐行术语句式编码进同一条 user 消息的固定前缀，使用完整中文语言标签。每次请求明确当前目标语言，后续复用完整前缀 token 和 KV，不按当前原文筛词。术语表 token 上限仍按 canonical TSV 计算，实际渲染前缀另查上下文容量，不自动压缩输出预算。部署与容量规则见 [术语表说明](glossary.md)。LLM 本地请求超时或通信失败时，Rust 停止并回收子进程，再返回错误；此时需要重启 StreamTrans。
+生产推理使用 FP16 KV 缓存，FlashAttention 由 llama.cpp 自动选择。未加载术语表时使用 `cache_prompt=false`；加载术语表时，启动只读入一次完整 canonical TSV，再将所有语言的全部条目按官方推荐的逐行术语句式编码进同一条 user 消息的固定前缀，使用完整中文语言标签。每次请求明确当前目标语言，后续复用完整前缀 token 和 KV，不按当前原文筛词。术语表 token 上限仍按 canonical TSV 计算，实际渲染前缀另查上下文容量，不自动压缩输出预算。部署与容量规则见 [术语表说明](glossary.md)。LLM 本地请求超时或通信失败时，Windows 请求取消并等待原生线程停止，Linux 停止并回收子进程，再返回错误；此时需要重启 StreamTrans。Windows 的取消在可检查的加载或推理阶段生效，不提供对任意 CUDA 内核的强制中断。
 
 指定译法仍由模型理解，不能保证语言隔离或强制遵从。例如日语请求仍可能带入仅为英语指定的 `on-device`；不能把提示格式调整当作这项限制已经解决。
 
@@ -105,7 +105,7 @@ Windows 分发以 llama.cpp b11960 固定提交 `8642541b255bfb5dc39cd351a178be0
 
 `scripts/setup-cuda-runtime.ps1` 按固定版本和 SHA256 准备运行 DLL 和许可证，供两个后端共用。两个开发后端目录使用同一套版本和下载缓存；Windows 分发目录只保留 `runtime/cudart64_12.dll`、`runtime/cublas64_12.dll`、`runtime/cublasLt64_12.dll` 各一份。原始组件来源见 [NVIDIA CUDA 12.8.1 分发清单](https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.8.1.json)。llama.cpp 构建要求已安装的 CMake 位于 `PATH`，Ninja 可来自 `PATH` 或 Visual Studio 组件；构建脚本将固定的 CUDA 12.8.1 编译组件下载到项目内 `.tools/llama-build-cuda128/cuda`，无须全局安装 CUDA Toolkit。构建及运行均不使用 Python；运行机器不需要 CUDA Toolkit 或 NVCC。
 
-原预编译 transcribe.cpp 0.4.1 使用 ggml 0.26，与 llama.cpp b11960 的 ggml 0.28 不能直接互换；单独复制 `ggml-cuda.dll` 会留下其他 ggml ABI 差异。当前方案先按同源头文件重编 ASR，再共享完整的 `ggml.dll`、`ggml-base.dll`、`ggml-cuda.dll` 和 9 个 CPU 变体。ASR、llama-server 及其服务端依赖、ggml、CUDA、FFmpeg、MSVC DLL 全部平铺到 `runtime` 根目录。升级时使用完整的新发行目录，不要手工混入旧版 ASR 或 ggml DLL。目录布局与来源记录见 [分发说明](distribution.md#目录布局)，本次构建验证见 [共享 ggml 验证](shared-ggml-20261107.md)。
+原预编译 transcribe.cpp 0.4.1 使用 ggml 0.26，与 llama.cpp b11960 的 ggml 0.28 不能直接互换；单独复制 `ggml-cuda.dll` 会留下其他 ggml ABI 差异。当前方案先按同源头文件重编 ASR，再共享完整的 `ggml.dll`、`ggml-base.dll`、`ggml-cuda.dll` 和 9 个 CPU 变体。ASR、`llama-server-impl.dll` 及其依赖、ggml、CUDA、FFmpeg、MSVC DLL 全部平铺到 `runtime` 根目录，分发包不携带 `llama-server.exe`。升级时使用完整的新发行目录，不要手工混入旧版 ASR 或 ggml DLL。目录布局与来源记录见 [分发说明](distribution.md#目录布局)，此前共享 ggml 构建的验证见 [共享 ggml 验证](shared-ggml-20261107.md)，其中的双进程记录不代表当前进程内运行方式。
 
 ## FSMN-VAD 分段
 
@@ -131,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File scripts/setup.ps1 -Gpu 0
 
 脚本下载并校验固定版本的 llama.cpp、transcribe.cpp 源码、CUDA 12.8 组件和 FFmpeg 9.0 LGPL 共享库，依次构建带兼容补丁的 llama.cpp/ggml、链接同源 ggml 的 ASR、音频桥，最后执行 `cargo build --release`。Windows 文件上传直接通过 DLL 解码和重采样；`--ffmpeg-library` 可覆盖默认 `.tools/ffmpeg-shared/bin/streamtrans-ffmpeg.dll` 路径，四个配套 FFmpeg DLL 应在同一目录。桥接 DLL 使用同包头文件和导入库构建，Rust 通过现有 `libloading` 调用，不需要 Python、pkg-config 或 bindgen。Candle 仅用于 CPU VAD 和 ASR 权重转换，不启用 Candle CUDA；CUDA 内核由 llama.cpp 原生构建过程编译。开发用原生程序与运行库放入项目内 `.tools`；分发目录只携带运行依赖，不携带编译工具。
 
-`scripts/setup-llama.ps1` 调用 `scripts/build-llama.ps1` 构建固定源码及 ggml 兼容补丁，并校验共享 CUDA 运行库，默认输出到 `.tools/llama-shared`。`scripts/build-asr.ps1` 读取该目录的运行库清单，复用同一次 llama 构建缓存中的 ggml 头文件和导入库，将 ASR 输出到 `.tools/transcribe-shared`；可用 `-LlamaDirectory` 选择配套 llama 构建。两个构建脚本均可用 `-OutputDirectory` 覆盖输出目录，`-Jobs` 控制并行构建数，默认 `4`。开发模式的 ASR 默认路径为 `.tools/transcribe-shared/transcribe.dll`，发行模式优先查找 `runtime/transcribe.dll`，仍可发现旧 `runtime/asr/transcribe.dll` 路径。使用自定义目录时，通过 `--llama-server` 与 `--asr-library` 显式指定入口。
+`scripts/setup-llama.ps1` 调用 `scripts/build-llama.ps1` 构建固定源码、ggml 兼容补丁及进程内服务入口，并校验共享 CUDA 运行库，默认输出到 `.tools/llama-embedded`。`scripts/build-asr.ps1` 读取该目录的运行库清单，复用同一次 llama 构建缓存中的 ggml 头文件和导入库，将 ASR 输出到 `.tools/transcribe-shared`；可用 `-LlamaDirectory` 选择配套 llama 构建。两个构建脚本均可用 `-OutputDirectory` 覆盖输出目录，`-Jobs` 控制并行构建数，默认 `4`。开发模式的 ASR 默认路径为 `.tools/transcribe-shared/transcribe.dll`，发行模式优先查找 `runtime/transcribe.dll`，仍可发现旧 `runtime/asr/transcribe.dll` 路径。Windows 使用自定义目录时，通过 `--llama-library` 与 `--asr-library` 显式指定入口。
 
 从项目根目录启动：
 

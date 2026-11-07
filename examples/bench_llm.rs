@@ -5,6 +5,9 @@ mod glossary;
 #[allow(dead_code)]
 #[path = "../src/llm.rs"]
 mod llm;
+#[cfg(windows)]
+#[path = "../src/native_library.rs"]
+mod native_library;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use llm::{Llm, SamplingParams};
@@ -21,6 +24,7 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(about = "打包版 llama.cpp 翻译基准；首轮和热态分别输出 JSON Lines")]
 struct Args {
+    /// Windows: llama-server-impl.dll；Linux: llama-server 可执行文件。
     #[arg(long)]
     server: PathBuf,
     #[arg(long)]
@@ -178,6 +182,7 @@ fn main() -> Result<()> {
         args.context_size,
         args.max_tokens,
         Duration::from_secs(args.startup_timeout_seconds),
+        &std::sync::atomic::AtomicBool::new(false),
     )?;
     model.set_timeout(Duration::from_secs(args.timeout_seconds));
     emit(
@@ -229,9 +234,7 @@ fn main() -> Result<()> {
                         "elapsed_ms":started.elapsed().as_secs_f64()*1000.0}),
                     );
                     if !model.healthy() {
-                        emit(
-                            json!({"event":"aborted","reason":"LLM 子进程已停止，剩余样本未执行"}),
-                        );
+                        emit(json!({"event":"aborted","reason":"LLM 后端已停止，剩余样本未执行"}));
                         break 'cases;
                     }
                 }
@@ -246,7 +249,7 @@ fn main() -> Result<()> {
     }
     let started = Instant::now();
     drop(model);
-    emit(json!({"event":"teardown","kill_and_reap_ms":started.elapsed().as_secs_f64()*1000.0}));
+    emit(json!({"event":"teardown","stop_and_join_ms":started.elapsed().as_secs_f64()*1000.0}));
     emit(
         json!({"event":"summary","successful_runs":completed,"failed_runs":failed,
         "requested_runs":cases.len()*(args.warm_runs as usize+1)}),

@@ -35,8 +35,13 @@ pub struct Config {
     pub cache_dir: PathBuf,
     #[arg(long, default_value_os_t = default_asr_library())]
     pub asr_library: PathBuf,
+    #[cfg(not(windows))]
     #[arg(long, default_value_os_t = default_llama_server())]
     pub llama_server: PathBuf,
+    /// 进程内 llama.cpp 服务入口；配套 DLL 与此文件放在同一目录。
+    #[cfg(windows)]
+    #[arg(long, default_value_os_t = default_llama_library())]
+    pub llama_library: PathBuf,
     #[cfg(not(windows))]
     #[arg(long, default_value_os_t = default_ffmpeg())]
     pub ffmpeg: PathBuf,
@@ -126,19 +131,20 @@ fn bundled_path(relative: &str) -> PathBuf {
         .unwrap_or_else(|| relative.into())
 }
 
+#[cfg(not(windows))]
 fn default_llama_server() -> PathBuf {
-    let name = if cfg!(windows) {
-        "llama-server.exe"
-    } else {
-        "llama-server"
-    };
+    let name = "llama-server";
     if let Some(packaged) = packaged_backend(&bundled_path("runtime"), name, "llama") {
         packaged
-    } else if cfg!(windows) {
-        ".tools/llama-shared/llama-server.exe".into()
     } else {
         ".tools/llama/llama-server".into()
     }
+}
+
+#[cfg(windows)]
+fn default_llama_library() -> PathBuf {
+    packaged_backend(&bundled_path("runtime"), "llama-server-impl.dll", "llama")
+        .unwrap_or_else(|| ".tools/llama-embedded/llama-server-impl.dll".into())
 }
 
 fn packaged_backend(runtime: &Path, name: &str, legacy: &str) -> Option<PathBuf> {
@@ -190,7 +196,10 @@ mod tests {
     fn packaged_backends_prefer_shared_directory_and_accept_legacy_layout() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let runtime = temporary.path();
-        for (name, legacy) in [("transcribe.dll", "asr"), ("llama-server.exe", "llama")] {
+        for (name, legacy) in [
+            ("transcribe.dll", "asr"),
+            ("llama-server-impl.dll", "llama"),
+        ] {
             assert!(packaged_backend(runtime, name, legacy).is_none());
             std::fs::create_dir(runtime.join(legacy))?;
             let old = runtime.join(legacy).join(name);
@@ -272,6 +281,24 @@ mod tests {
         assert_eq!(config.model_source, ModelSource::HuggingFace);
         assert!(config.llm_revision.is_none());
         assert!(Config::try_parse_from(["streamtrans", "--llm-thinking"]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_uses_embedded_library_instead_of_cli() {
+        let config = Config::try_parse_from([
+            "streamtrans",
+            "--llama-library",
+            "custom/llama-server-impl.dll",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.llama_library,
+            PathBuf::from("custom/llama-server-impl.dll")
+        );
+        assert!(
+            Config::try_parse_from(["streamtrans", "--llama-server", "llama-server.exe"]).is_err()
+        );
     }
 
     #[test]

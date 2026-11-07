@@ -7,6 +7,8 @@ mod convert_asr;
 mod glossary;
 mod llm;
 mod models;
+#[cfg(windows)]
+mod native_library;
 mod runtime;
 mod stream;
 mod vad;

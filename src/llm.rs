@@ -4,14 +4,24 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader, Read},
     net::TcpListener,
     path::Path,
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, Instant},
 };
+#[cfg(not(windows))]
+use std::{
+    io::{BufRead, BufReader, Read},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
+};
+#[cfg(windows)]
+#[path = "embedded_llama.rs"]
+mod embedded_llama;
+#[cfg(windows)]
+use embedded_llama::ServerProcess;
 
 use crate::glossary::Glossary;
 
@@ -130,6 +140,7 @@ impl Llm {
         context_size: u32,
         max_tokens: u32,
         startup_timeout: Duration,
+        cancelled: &AtomicBool,
     ) -> Result<Self> {
         ensure!(
             context_size > 1 && max_tokens > 0,
@@ -138,96 +149,95 @@ impl Llm {
         ensure!(!startup_timeout.is_zero(), "LLM 启动超时必须大于零");
         let server_path = server_path
             .canonicalize()
-            .context("找不到打包的 llama-server，请运行安装脚本")?;
+            .context("找不到打包的 llama.cpp 服务入口，请运行安装脚本")?;
         let model_path = model_path
             .canonicalize()
             .context("找不到 Hy-MT2-1.8B GGUF 模型")?;
+        ensure!(!cancelled.load(Ordering::Acquire), "翻译模型启动已取消");
+        #[cfg(windows)]
+        crate::native_library::configure_cuda(&server_path, gpu.try_into()?)?;
+        #[cfg(not(windows))]
         let directory = server_path.parent().context("llama-server 路径无效")?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).context("无法分配 LLM 本地端口")?;
         let port = listener.local_addr()?.port();
         let api_key = uuid::Uuid::new_v4().simple().to_string();
-        let mut command = Command::new(&server_path);
-        command
-            .current_dir(directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Pin CLI settings instead of inheriting llama-specific environment defaults.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            if name.starts_with("LLAMA_ARG_") || name == "LLAMA_API_KEY" {
-                command.env_remove(key);
-            }
-        }
-        let mut paths = vec![directory.to_owned()];
+        drop(listener);
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            if let Some(shared) = directory
-                .parent()
-                .filter(|path| path.join("cudart64_12.dll").is_file())
-            {
-                paths.push(shared.to_owned());
-            }
-            paths.extend(std::env::split_paths(
-                &std::env::var_os("PATH").unwrap_or_default(),
-            ));
-            command.env("PATH", std::env::join_paths(paths)?);
-        }
+        let process = ServerProcess::spawn(
+            &server_path,
+            &model_path,
+            gpu,
+            port,
+            context_size,
+            api_key.clone(),
+        )?;
         #[cfg(not(windows))]
-        {
+        let process = {
+            let mut command = Command::new(&server_path);
+            command
+                .current_dir(directory)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // Pin CLI settings instead of inheriting llama-specific environment defaults.
+            for (key, _) in std::env::vars_os() {
+                let name = key.to_string_lossy().to_ascii_uppercase();
+                if name.starts_with("LLAMA_ARG_") || name == "LLAMA_API_KEY" {
+                    command.env_remove(key);
+                }
+            }
+            let mut paths = vec![directory.to_owned()];
             paths.extend(std::env::split_paths(
                 &std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default(),
             ));
             command.env("LD_LIBRARY_PATH", std::env::join_paths(paths)?);
-        }
-        command.args([
-            "--model",
-            model_path.to_str().context("模型路径不是有效 UTF-8")?,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--api-key",
-            &api_key,
-            "--alias",
-            "Hy-MT2-1.8B",
-            "--device",
-            &format!("CUDA{gpu}"),
-            "--split-mode",
-            "none",
-            "--n-gpu-layers",
-            "all",
-            "--fit",
-            "off",
-            "--ctx-size",
-            &context_size.to_string(),
-            "--parallel",
-            "1",
-            "--cache-type-k",
-            "f16",
-            "--cache-type-v",
-            "f16",
-            "--flash-attn",
-            "auto",
-            "--warmup",
-            "--no-context-shift",
-            "--no-cache-prompt",
-            "--cache-ram",
-            "0",
-            "--no-cache-idle-slots",
-            "--threads-http",
-            "2",
-            "--no-webui",
-            "--log-verbosity",
-            // b11960 maps library INFO (including GPU offload receipts) to TRACE=4.
-            "4",
-            "--log-colors",
-            "off",
-        ]);
-        drop(listener);
-        let process = ServerProcess::spawn(&mut command, gpu, api_key.clone())?;
+            command.args([
+                "--model",
+                model_path.to_str().context("模型路径不是有效 UTF-8")?,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--api-key",
+                &api_key,
+                "--alias",
+                "Hy-MT2-1.8B",
+                "--device",
+                &format!("CUDA{gpu}"),
+                "--split-mode",
+                "none",
+                "--n-gpu-layers",
+                "all",
+                "--fit",
+                "off",
+                "--ctx-size",
+                &context_size.to_string(),
+                "--parallel",
+                "1",
+                "--cache-type-k",
+                "f16",
+                "--cache-type-v",
+                "f16",
+                "--flash-attn",
+                "auto",
+                "--warmup",
+                "--no-context-shift",
+                "--no-cache-prompt",
+                "--cache-ram",
+                "0",
+                "--no-cache-idle-slots",
+                "--threads-http",
+                "2",
+                "--no-webui",
+                "--log-verbosity",
+                // b11960 maps library INFO (including GPU offload receipts) to TRACE=4.
+                "4",
+                "--log-colors",
+                "off",
+            ]);
+
+            ServerProcess::spawn(&mut command, gpu, api_key.clone())?
+        };
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -244,7 +254,7 @@ impl Llm {
             timeout: Duration::from_secs(300),
             glossary: None,
         };
-        model.wait_ready(startup_timeout)?;
+        model.wait_ready(startup_timeout, cancelled)?;
         // Reject a wrong/legacy model rather than silently use its incompatible IDs.
         let special = model.tokenize(
             &format!("{BOS}{USER}{ASSISTANT}<｜hy_place▁holder▁no▁2｜>{SYSTEM_END}"),
@@ -275,12 +285,13 @@ impl Llm {
         Ok(model)
     }
 
-    fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
+    fn wait_ready(&mut self, timeout: Duration, cancelled: &AtomicBool) -> Result<()> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .context("LLM 启动超时设置过大")?;
         let mut ready_since = None;
         loop {
+            ensure!(!cancelled.load(Ordering::Acquire), "翻译模型启动已取消");
             if !self.healthy() {
                 return Err(anyhow!(
                     "llama-server 启动失败；{}",
@@ -478,10 +489,10 @@ impl Llm {
         body: &Value,
         deadline: Instant,
     ) -> Result<T> {
-        ensure!(self.healthy(), "LLM 子进程已停止，请重启服务");
+        ensure!(self.healthy(), "LLM 后端已停止，请重启服务");
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return self.stop_with_error("LLM 推理超时，子进程已停止，请重启服务".to_owned());
+            return self.stop_with_error("LLM 推理超时，后端已停止，请重启服务".to_owned());
         }
         let response = match self
             .client
@@ -498,26 +509,26 @@ impl Llm {
                 } else {
                     "LLM 本地 HTTP 请求失败"
                 };
-                return self.stop_with_error(format!("{reason}，子进程已停止，请重启服务"));
+                return self.stop_with_error(format!("{reason}，后端已停止，请重启服务"));
             }
         };
         if !response.status().is_success() {
             return self.stop_with_error(format!(
-                "LLM 返回 HTTP {}，子进程已停止，请重启服务",
+                "LLM 返回 HTTP {}，后端已停止，请重启服务",
                 response.status().as_u16()
             ));
         }
         match response.json() {
             Ok(value) => Ok(value),
             Err(_) => self
-                .stop_with_error("LLM 响应读取失败或格式无效，子进程已停止，请重启服务".to_owned()),
+                .stop_with_error("LLM 响应读取失败或格式无效，后端已停止，请重启服务".to_owned()),
         }
     }
     fn stop_with_error<T>(&mut self, message: String) -> Result<T> {
-        // Reap before returning: an HTTP timeout must not leave GPU work behind.
+        // Wait before returning so a timed-out request cannot overlap subsequent GPU work.
         self.process
             .stop()
-            .context("无法回收 LLM 子进程，请停止并重启服务")?;
+            .context("无法回收 LLM 后端，请停止并重启服务")?;
         Err(anyhow!(message))
     }
 }
@@ -776,11 +787,13 @@ impl StartupLogs {
         }
     }
 }
+#[cfg(not(windows))]
 struct ServerProcess {
     child: Option<Child>,
     readers: Vec<JoinHandle<()>>,
     logs: Arc<Mutex<StartupLogs>>,
 }
+#[cfg(not(windows))]
 impl ServerProcess {
     fn spawn(command: &mut Command, gpu: usize, api_key: String) -> Result<Self> {
         let child = command.spawn().context(
@@ -847,7 +860,7 @@ impl ServerProcess {
             child
                 .wait()
                 .map(|_| ())
-                .context("无法等待 llama-server 子进程退出")
+                .context("无法等待 llama-server 后端退出")
         } else {
             Ok(())
         };
@@ -863,6 +876,7 @@ impl ServerProcess {
             .unwrap_or_else(|_| "启动诊断状态异常".to_owned())
     }
 }
+#[cfg(not(windows))]
 impl Drop for ServerProcess {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -1085,6 +1099,7 @@ mod tests {
         assert!(!logs.diagnostics().contains("private request text"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn invalid_utf8_does_not_discard_later_gpu_receipts() {
         let logs = Arc::new(Mutex::new(StartupLogs {

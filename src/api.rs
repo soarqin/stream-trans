@@ -106,7 +106,7 @@ async fn health(State(state): State<AppState>) -> Response {
         error(
             StatusCode::SERVICE_UNAVAILABLE,
             "backend_unavailable",
-            "模型进程不可用，请查看日志并重启服务",
+            "模型后端不可用，请查看日志并重启服务",
         )
         .into_response()
     }
