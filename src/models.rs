@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -648,6 +648,7 @@ async fn download_file_at(
     let mut output = tokio::fs::File::from_std(partial.reopen()?);
     let mut digest = Sha256::new();
     let mut received = 0u64;
+    let mut last_progress = Instant::now();
     while let Some(chunk) = response.chunk().await? {
         received = received
             .checked_add(chunk.len() as u64)
@@ -659,6 +660,17 @@ async fn download_file_at(
         );
         digest.update(&chunk);
         output.write_all(&chunk).await?;
+        if received < record.size && last_progress.elapsed() >= Duration::from_secs(1) {
+            tracing::info!(
+                model = spec.id,
+                file = name,
+                "下载进度：{:.1}%（{:.2}/{:.2} MiB）",
+                (received as f64 / record.size as f64 * 100.0).min(99.9),
+                received as f64 / 1_048_576.0,
+                record.size as f64 / 1_048_576.0,
+            );
+            last_progress = Instant::now();
+        }
     }
     ensure!(
         received == record.size,
@@ -677,6 +689,12 @@ async fn download_file_at(
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("无法保存模型文件：{}", path.display()))?;
+    tracing::info!(
+        model = spec.id,
+        file = name,
+        "模型文件下载完成：100%（{:.2} MiB）",
+        record.size as f64 / 1_048_576.0,
+    );
     Ok(())
 }
 
