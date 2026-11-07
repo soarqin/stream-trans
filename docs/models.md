@@ -89,13 +89,21 @@ d98fe604dec1f28f58f80d7d560f7177e584d3b8e5835862687660e5ff97cb40
 
 `llama-server` 由 Rust 启动，绑定 `127.0.0.1` 的临时端口，使用启动时生成的 API 密钥。服务加载模型并检查 CUDA 后端后，再开放 StreamTrans 音频接口。子进程退出后，健康检查将报告后端不可用；StreamTrans 退出时清理托管子进程。该接口仅供 Rust 主进程调用，不作为外部模型 API 分发。
 
-`--llama-server` 可指定可执行文件。Windows 开发模式默认使用 `.tools/llama/llama-server.exe`，发行模式使用可执行文件旁的 `runtime/llama/llama-server.exe`。默认 `--context-size 4096`、`--max-tokens 2048`，输出预算用于译文。当前服务的参数范围不代表原模型完整的上下文能力。
+`--llama-server` 可指定可执行文件。Windows 开发模式默认使用 `.tools/llama-cuda128/llama-server.exe`，发行模式使用可执行文件旁的 `runtime/llama/llama-server.exe`。默认 `--context-size 4096`、`--max-tokens 2048`，输出预算用于译文。当前服务的参数范围不代表原模型完整的上下文能力。
 
 生产子进程使用 FP16 KV 缓存，FlashAttention 由 llama.cpp 自动选择。未加载术语表时使用 `cache_prompt=false`；加载术语表时，启动只读入一次完整 canonical TSV，再将所有语言的全部条目按官方推荐的逐行术语句式编码进同一条 user 消息的固定前缀，使用完整中文语言标签。每次请求明确当前目标语言，后续复用完整前缀 token 和 KV，不按当前原文筛词。术语表 token 上限仍按 canonical TSV 计算，实际渲染前缀另查上下文容量，不自动压缩输出预算。部署与容量规则见 [术语表说明](glossary.md)。LLM 本地请求超时或通信失败时，Rust 停止并回收子进程，再返回错误；此时需要重启 StreamTrans。
 
 指定译法仍由模型理解，不能保证语言隔离或强制遵从。例如日语请求仍可能带入仅为英语指定的 `on-device`；不能把提示格式调整当作这项限制已经解决。
 
 新模型的完整性、术语遵从和速度记录见 [Hy-MT2 复测](hy-mt2-20261103.md)。此前 MiniCPM5 的 FP32 KV、FlashAttention 关闭及思考模式对照属于历史实验，其数字不代表当前模型。
+
+## Windows 共享 CUDA 运行库
+
+Windows 分发保留 transcribe.cpp v0.4.1 和 llama.cpp b11960 的固定版本，统一携带 CUDART 12.8.90 与 cuBLAS 12.8.4.1。ASR 使用上游 CUDA 12.8 编译产物；llama.cpp 从固定提交 `8642541b255bfb5dc39cd351a178be09013a55d6` 使用 CUDA Toolkit 12.8.1 本地构建，使编译和运行均使用 CUDA 12.8。
+
+`scripts/setup-cuda-runtime.ps1` 按固定版本和 SHA256 准备运行 DLL 和许可证，供两个后端共用。两个开发后端目录使用同一套版本和下载缓存；Windows 分发目录只保留 `runtime/cudart64_12.dll`、`runtime/cublas64_12.dll`、`runtime/cublasLt64_12.dll` 各一份。原始组件来源见 [NVIDIA CUDA 12.8.1 分发清单](https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.8.1.json)。llama.cpp 构建要求已安装的 CMake 位于 `PATH`，Ninja 可来自 `PATH` 或 Visual Studio 组件；构建脚本将固定的 CUDA 12.8.1 编译组件下载到项目内 `.tools/llama-build-cuda128/cuda`，无须全局安装 CUDA Toolkit。构建及运行均不使用 Python；运行机器不需要 CUDA Toolkit 或 NVCC。
+
+两套 ggml 继续隔离：ASR 的 `transcribe.dll` 依赖其配套 ggml 的 ABI，包括 `ggml_backend_set_reg_filter`；使用相同 CUDA 版本不表示两套 ggml 可以互换。`runtime/asr` 保存 ASR 后端，`runtime/llama` 保存 llama.cpp 后端，不能将同名 ggml DLL 平铺覆盖。ASR 注册后端目录与共享目录的 DLL 搜索路径，llama-server 子进程的 `PATH` 包含共享目录。FFmpeg 解码 DLL 与共享 CUDA 同放在 `runtime` 根目录。目录布局与来源记录见 [分发说明](distribution.md#目录布局)。
 
 ## FSMN-VAD 分段
 
@@ -108,7 +116,7 @@ VAD 检测语音活动边界，不保证每段都是完整语句。原生浮点�
 构建需要：
 
 - Windows x64、Rust stable、Visual Studio 2022 C++ Build Tools，安装「使用 C++ 的桌面开发」组件。
-- 构建不需要 CUDA Toolkit 或 NVCC。
+- 构建 llama.cpp 需事先安装 CMake 并加入 `PATH`；Ninja 可来自 `PATH` 或 Visual Studio 组件。脚本将 CUDA 12.8.1 编译组件下载到项目目录，无须全局安装；单独重新编译 Rust 服务不使用 NVCC。
 - 运行需要支持原生 BF16 的 NVIDIA GPU，以及兼容随包 CUDA 运行库的 NVIDIA 驱动。
 - 首次安装可访问原生程序上游下载站点和 crates.io；首次模型下载可访问所选的 Hugging Face 或 ModelScope。
 
@@ -118,7 +126,9 @@ VAD 检测语音活动边界，不保证每段都是完整语句。原生浮点�
 powershell -ExecutionPolicy Bypass -File scripts/setup.ps1 -Gpu 0
 ```
 
-脚本下载并校验 ASR 原生库、llama.cpp 和 CUDA 运行库，然后执行 `cargo build --release`。FFmpeg 需放入 `PATH`，或通过 `--ffmpeg` 指定路径。Candle 仅用于 CPU VAD 和 ASR 权重转换，不再启用 Candle CUDA 或编译 CUDA 内核。原生推理后端使用预编译二进制，运行库放入项目内 `.tools`；系统不需要安装 CUDA Toolkit。
+脚本下载并校验 ASR 原生库、llama.cpp 固定源码、CUDA 12.8 组件和 FFmpeg 9.0 LGPL 共享库，构建 llama.cpp 与音频桥后执行 `cargo build --release`。Windows 文件上传直接通过 DLL 解码和重采样；`--ffmpeg-library` 可覆盖默认 `.tools/ffmpeg-shared/bin/streamtrans-ffmpeg.dll` 路径，四个配套 FFmpeg DLL 应在同一目录。桥接 DLL 使用同包头文件和导入库构建，Rust 通过现有 `libloading` 调用，不需要 Python、pkg-config 或 bindgen。Candle 仅用于 CPU VAD 和 ASR 权重转换，不启用 Candle CUDA；CUDA 内核由 llama.cpp 原生构建过程编译。开发用原生程序与运行库放入项目内 `.tools`；分发目录只携带运行依赖，不携带编译工具。
+
+`scripts/setup-llama.ps1` 调用 `scripts/build-llama.ps1` 构建固定源码，并校验共享 CUDA 运行库。默认输出到 `.tools/llama-cuda128`，可用 `-OutputDirectory` 覆盖；`-Jobs` 控制并行构建数，默认 `4`。使用自定义目录时，启动服务需通过 `--llama-server` 指向该目录下的 `llama-server.exe`。
 
 从项目根目录启动：
 

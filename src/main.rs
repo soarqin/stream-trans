@@ -1,5 +1,7 @@
 mod api;
 mod asr;
+#[cfg(windows)]
+mod audio;
 mod config;
 mod convert_asr;
 mod glossary;

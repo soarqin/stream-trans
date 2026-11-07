@@ -13,8 +13,9 @@ use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(not(windows))]
+use tokio::process::Command;
 use tokio::{
-    process::Command,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     time::{Instant, timeout},
 };
@@ -81,17 +82,22 @@ impl Runtime {
         if config.download_only {
             return Ok(());
         }
-        let ffmpeg = timeout(
-            Duration::from_secs(15),
-            Command::new(&config.ffmpeg)
-                .arg("-version")
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .context("FFmpeg 检查超时")?
-        .context("找不到 FFmpeg，请先安装或使用 --ffmpeg 指定路径")?;
-        ensure!(ffmpeg.status.success(), "FFmpeg 启动失败");
+        #[cfg(windows)]
+        crate::audio::Decoder::load(&config.ffmpeg_library)?;
+        #[cfg(not(windows))]
+        {
+            let ffmpeg = timeout(
+                Duration::from_secs(15),
+                Command::new(&config.ffmpeg)
+                    .arg("-version")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .context("FFmpeg 检查超时")?
+            .context("找不到 FFmpeg，请先安装或使用 --ffmpeg 指定路径")?;
+            ensure!(ffmpeg.status.success(), "FFmpeg 启动失败");
+        }
         ensure!(
             config.asr_library.is_file(),
             "找不到 ASR 原生库 {}，请先运行 scripts/setup.ps1",

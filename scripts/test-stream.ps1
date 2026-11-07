@@ -4,14 +4,15 @@
 .EXAMPLE
 .\scripts\test-stream.ps1 -Wav .\audio.wav -AssertBeforeFinish -OutputPath .\stream.jsonl
 .EXAMPLE
-.\scripts\test-stream.ps1 -Wav .\audio.mp3 -Ffmpeg .\runtime\ffmpeg\ffmpeg.exe -SendAsFastAsPossible
+.\scripts\test-stream.ps1 -Wav .\audio.mp3 -Ffmpeg C:\Tools\ffmpeg\bin\ffmpeg.exe -SendAsFastAsPossible
 .EXAMPLE
 .\scripts\test-stream.ps1 -Wav .\audio.wav -RequestKey your-key
 .NOTES
 默认按真实时长发送 100 ms 音频块。快速发送可能触发服务端 audio_buffer_full，适合验证 finish。
+默认直接读取 16 kHz 单声道 PCM16 WAV；-Ffmpeg 仅用于开发测试前转换其他格式，不是新服务端发行包的运行依赖。
 请求 key 默认从 STREAMTRANS_REQUEST_KEY 读取，以 Bearer 握手头发送，不放入 URL 或输出记录。
 每行输出 elapsedMs、sentAudioMs、finishSent 和完整 event。finishSent 从开始发送 finish 时置真，
-因此 AssertBeforeFinish 保守地要求首个 transcript 和 translation 都在此之前被接收。
+因此 AssertBeforeFinish 要求首个 transcript 在此之前被接收；翻译模式还要求首个 translation 提前返回。
 #>
 [CmdletBinding()]
 param(
@@ -170,6 +171,7 @@ try {
     $message = New-Object IO.MemoryStream
     $receiveTask = $socket.ReceiveAsync($receiveBuffer, $cancellation.Token)
     $ready = $false
+    $mode = $null
     $firstTranscriptBeforeFinish = $null
     $firstTranslationBeforeFinish = $null
 
@@ -203,6 +205,7 @@ try {
                 'ready' {
                     if ($ready) { throw '服务重复发送 ready，请检查接口协议。' }
                     $ready = $true
+                    $mode = $event.mode
                     $senderTask = $probe.SendAudioAsync($socket, $pcm, $ChunkMs * 32, ($Realtime -and -not $SendAsFastAsPossible), $cancellation.Token)
                 }
                 'transcript' {
@@ -223,8 +226,8 @@ try {
         }
         if (-not $done) { $receiveTask = $socket.ReceiveAsync($receiveBuffer, $cancellation.Token) }
     }
-    if ($AssertBeforeFinish -and ($firstTranscriptBeforeFinish -ne $true -or $firstTranslationBeforeFinish -ne $true)) {
-        throw '提前返回验证失败：首个 transcript 和 translation 必须都在发送 finish 之前到达。请使用包含句间停顿且足够长的音频，并保持实时发送。'
+    if ($AssertBeforeFinish -and ($firstTranscriptBeforeFinish -ne $true -or ($mode -eq 'translate' -and $firstTranslationBeforeFinish -ne $true))) {
+        throw '提前返回验证失败：首个 transcript 必须在发送 finish 之前到达；翻译模式还需首个 translation。请使用包含句间停顿且足够长的音频，并保持实时发送。'
     }
 } catch {
     $failure = $_.Exception.GetBaseException().Message

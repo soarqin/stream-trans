@@ -1,4 +1,8 @@
-use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(any(not(windows), test))]
+use std::time::Duration;
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -11,11 +15,11 @@ use axum::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::{
-    process::Command,
-    sync::Semaphore,
-    time::{Instant, timeout},
-};
+#[cfg(not(windows))]
+use tokio::process::Command;
+#[cfg(any(not(windows), test))]
+use tokio::time::timeout;
+use tokio::{sync::Semaphore, time::Instant};
 
 use crate::{
     config::Config,
@@ -204,7 +208,9 @@ async fn process_audio(
         let input = temp.path().join("input.audio");
         let wav = temp.path().join("audio.wav");
         tokio::fs::write(&input, audio).await.map_err(internal)?;
+        let decode_started = Instant::now();
         let duration_ms = normalize_audio(&state.config, &input, &wav).await?;
+        let decode_ms = decode_started.elapsed().as_millis();
         let asr_started = Instant::now();
         let recognition = state.backend.recognize(&wav, &source).await
             .map_err(|e| backend_error("asr_failed", e))?;
@@ -229,7 +235,7 @@ async fn process_audio(
             "mode":if translate {"translate"} else {"transcribe"},
             "text":recognition.text, "translation":translation, "segments":recognition.segments,
             "source_language":source, "target_language":target, "duration_ms":duration_ms,
-            "elapsed_ms":{"asr":asr_ms,"translation":translation_ms,"total":started.elapsed().as_millis()},
+            "elapsed_ms":{"audio_decode":decode_ms,"asr":asr_ms,"translation":translation_ms,"total":started.elapsed().as_millis()},
             "models":model_names()
         })))
     }).await.map_err(internal)?
@@ -250,6 +256,41 @@ pub(super) fn validate_target(value: &str) -> Result<String, ApiError> {
     Ok(crate::glossary::normalize_target(value))
 }
 
+#[cfg(windows)]
+async fn normalize_audio(config: &Config, input: &Path, wav: &Path) -> Result<u64, ApiError> {
+    let library = config.ffmpeg_library.clone();
+    let input = input.to_owned();
+    let wav = wav.to_owned();
+    let seconds = config.max_audio_seconds;
+    tokio::task::spawn_blocking(move || {
+        let decoder = crate::audio::Decoder::load(&library).map_err(internal)?;
+        let samples = decoder.decode(&input, seconds as usize * 16_000, 30_000).map_err(|cause| {
+            use crate::audio::DecodeError;
+            match cause {
+                DecodeError::Timeout => error(StatusCode::UNPROCESSABLE_ENTITY, "audio_decode_timeout", "音频解码超时，请缩短或重新编码音频后重试"),
+                DecodeError::TooLong => error(StatusCode::UNPROCESSABLE_ENTITY, "audio_too_long", format!("音频超过 {seconds} 秒，请分段上传或调整 --max-audio-seconds")),
+                DecodeError::Invalid(details) => {
+                    tracing::warn!(%details, "音频解码失败");
+                    error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_audio", "无法解码音频，请提供有效的 WAV、MP3、FLAC、M4A 或其他 FFmpeg 支持的音频文件")
+                }
+                DecodeError::Internal(cause) => internal(cause),
+            }
+        })?;
+        if samples.is_empty() {
+            return Err(error(StatusCode::UNPROCESSABLE_ENTITY, "empty_audio", "音频中没有可解码的采样数据"));
+        }
+        let mut writer = hound::WavWriter::create(&wav, hound::WavSpec {
+            channels: 1, sample_rate: 16_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int,
+        }).map_err(internal)?;
+        for sample in &samples {
+            writer.write_sample((sample.clamp(-1.0, 1.0) * 32768.0).round() as i16).map_err(internal)?;
+        }
+        writer.finalize().map_err(internal)?;
+        Ok(samples.len() as u64 * 1000 / 16_000)
+    }).await.map_err(internal)?
+}
+
+#[cfg(not(windows))]
 async fn normalize_audio(config: &Config, input: &Path, wav: &Path) -> Result<u64, ApiError> {
     let result = timeout(
         Duration::from_secs(30),

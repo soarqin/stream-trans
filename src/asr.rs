@@ -80,7 +80,7 @@ struct Api {
 pub struct Asr {
     api: Api,
     #[cfg(windows)]
-    _dll_directory: DllDirectory,
+    _dll_directories: Vec<DllDirectory>,
     model: Handle,
     session: Handle,
 }
@@ -98,7 +98,10 @@ impl Asr {
             )
         })?;
         #[cfg(windows)]
-        let dll_directory = DllDirectory::add(library_path.parent().context("ASR 库目录无效")?)?;
+        let dll_directories = dll_search_directories(&library_path)
+            .into_iter()
+            .map(|path| DllDirectory::add(&path))
+            .collect::<Result<Vec<_>>>()?;
         #[cfg(windows)]
         let library = unsafe {
             libloading::os::windows::Library::load_with_flags(
@@ -217,7 +220,7 @@ impl Asr {
             let mut asr = Self {
                 api,
                 #[cfg(windows)]
-                _dll_directory: dll_directory,
+                _dll_directories: dll_directories,
                 model: ptr::null_mut(),
                 session: ptr::null_mut(),
             };
@@ -314,6 +317,39 @@ impl Drop for Asr {
 
 fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.to_str().context("路径必须为有效 UTF-8")?).context("路径包含 NUL 字符")
+}
+
+#[cfg(any(windows, test))]
+fn dll_search_directories(library: &Path) -> Vec<std::path::PathBuf> {
+    let directory = library
+        .parent()
+        .expect("canonical library path has a parent");
+    let mut directories = vec![directory.to_owned()];
+    if let Some(shared) = directory
+        .parent()
+        .filter(|path| path.join("cudart64_12.dll").is_file())
+    {
+        directories.push(shared.to_owned());
+    }
+    directories
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_cuda_search_keeps_backend_libraries_isolated() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let runtime = temporary.path().join("runtime");
+        let asr = runtime.join("asr");
+        std::fs::create_dir_all(&asr)?;
+        let library = asr.join("transcribe.dll");
+        assert_eq!(dll_search_directories(&library), std::slice::from_ref(&asr));
+        std::fs::write(runtime.join("cudart64_12.dll"), [])?;
+        assert_eq!(dll_search_directories(&library), [asr, runtime]);
+        Ok(())
+    }
 }
 
 #[cfg(windows)]

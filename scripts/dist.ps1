@@ -5,68 +5,127 @@ param(
     [string]$Ffmpeg,
     [string]$FfmpegLicenseDirectory,
     [string]$FfmpegSourceUrl,
-    [string]$MsvcRedistDirectory
+    [string]$MsvcRedistDirectory,
+    [string]$LlamaDirectory,
+    [string]$FfmpegDirectory
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($Ffmpeg -or $FfmpegLicenseDirectory -or $FfmpegSourceUrl) {
+    throw 'FFmpeg 已改为动态库调用；旧 -Ffmpeg/-FfmpegLicenseDirectory/-FfmpegSourceUrl 参数已停用。请运行 scripts/setup-ffmpeg.ps1，或使用 -FfmpegDirectory 指定其输出根目录。'
+}
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot 'dist/StreamTrans' }
 $output = [IO.Path]::GetFullPath($OutputDirectory)
-if (Test-Path -LiteralPath $output) {
-    $existing = Get-Item -LiteralPath $output -Force
-    if (-not $existing.PSIsContainer -or ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -or @(Get-ChildItem -LiteralPath $output -Force).Count -gt 0) {
-        throw "输出目录必须不存在或为空，脚本不会覆盖非空目录：$output。请指定新的 -OutputDirectory。"
+function Assert-EmptyOutput {
+    if (Test-Path -LiteralPath $output) {
+        $existing = Get-Item -LiteralPath $output -Force
+        if (-not $existing.PSIsContainer -or ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -or @(Get-ChildItem -LiteralPath $output -Force).Count -gt 0) {
+            throw "输出目录必须不存在或为空，脚本不会覆盖非空目录：$output。请指定新的 -OutputDirectory。"
+        }
+    }
+}
+Assert-EmptyOutput
+
+function Copy-Exclusive([string]$Source, [string]$Destination) {
+    # Distinct ggml ABIs must never overwrite another backend's files.
+    [IO.File]::Copy($Source, $Destination, $false)
+}
+
+function Assert-RecordedArtifact([string]$Directory, $Files, [string]$Name, [string]$Component = 'llama.cpp', [string]$SetupScript = 'scripts/setup-llama.ps1') {
+    $records = @($Files | Where-Object { $_.PSObject.Properties['name'] -and $_.name -ieq $Name })
+    if ($records.Count -ne 1 -or -not $records[0].PSObject.Properties['sha256'] -or
+        $records[0].sha256 -notmatch '^[a-fA-F0-9]{64}$') {
+        throw "$Component 构建记录缺少有效的文件校验值：$Name。请重新运行 $SetupScript。"
+    }
+    $path = Join-Path $Directory $Name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $records[0].sha256) {
+        throw "$Component 构建产物与记录不匹配：$path。请重新运行 $SetupScript。"
     }
 }
 
 $asr = Join-Path $projectRoot '.tools/transcribe/transcribe-native-windows-x86_64-cuda'
-$llama = Join-Path $projectRoot '.tools/llama'
+if (-not $LlamaDirectory) { $LlamaDirectory = Join-Path $projectRoot '.tools/llama-cuda128' }
+$llama = [IO.Path]::GetFullPath($LlamaDirectory)
 $msvcLicenses = Join-Path $projectRoot '.tools/licenses/msvc'
+$asrDlls = @('transcribe.dll','ggml.dll','ggml-base.dll','ggml-cpu.dll','ggml-cuda.dll')
+$llamaCoreDlls = @('llama-server-impl.dll','llama-common.dll','llama.dll','mtmd.dll','ggml.dll','ggml-base.dll','ggml-cuda.dll')
+$llamaOptionalDlls = @('vcomp140.dll','libomp.dll')
+$sharedCuda = @{
+    'cudart64_12.dll' = 'c2c9a9c22a9bcba90e261825968836787b331038047a26770cffb7a583c28344'
+    'cublas64_12.dll' = '9513540e4ec4c51ee9e7304138c2cc255c29a8c181f9e80c38efa25738becd99'
+    'cublasLt64_12.dll' = 'b199d1ff892a81b7fd3d57ba1781549609b41500b36008fef326038393ad46c7'
+}
 foreach ($required in @(
-    (Join-Path $asr 'transcribe.dll'), (Join-Path $asr 'ggml-cuda.dll'),
-    (Join-Path $asr 'cudart64_12.dll'), (Join-Path $asr 'cublas64_12.dll'), (Join-Path $asr 'cublasLt64_12.dll'),
     (Join-Path $asr 'licenses/LICENSE'), (Join-Path $asr 'licenses/cuda-asr/cuda_cudart-LICENSE'),
     (Join-Path $asr 'licenses/cuda-asr/libcublas-LICENSE'), (Join-Path $asr '.streamtrans-runtime.json'),
-    (Join-Path $llama 'llama-server.exe'), (Join-Path $llama 'llama-server-impl.dll'),
-    (Join-Path $llama 'mtmd.dll'), (Join-Path $llama 'cublas64_12.dll'), (Join-Path $llama 'cublasLt64_12.dll'),
-    (Join-Path $llama 'cudart64_12.dll'), (Join-Path $llama 'licenses/LICENSE-llama.cpp'),
-    (Join-Path $llama 'licenses/cuda-12.4-EULA.html'), (Join-Path $llama '.streamtrans-runtime.json'),
+    (Join-Path $llama 'llama-server.exe'), (Join-Path $llama 'licenses/LICENSE-llama.cpp'),
+    (Join-Path $llama '.streamtrans-runtime.json'),
     (Join-Path $msvcLicenses 'Visual-C-Runtime-2015-2022-License.docx')
-)) {
+) + @($asrDlls | ForEach-Object { Join-Path $asr $_ }) + @($llamaCoreDlls | ForEach-Object { Join-Path $llama $_ })) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "缺少分发依赖：$required。请先执行 .\scripts\setup.ps1。" }
 }
+$asrProvenance = Get-Content -LiteralPath (Join-Path $asr '.streamtrans-runtime.json') -Raw | ConvertFrom-Json
+$llamaProvenance = Get-Content -LiteralPath (Join-Path $llama '.streamtrans-runtime.json') -Raw | ConvertFrom-Json
+$llamaCudaBuild = if ($llamaProvenance.PSObject.Properties['cuda_build']) { $llamaProvenance.cuda_build } else { $null }
+$llamaRuntimeMatches = $llamaProvenance.PSObject.Properties['cuda_runtime'] -and
+    $llamaProvenance.cuda_runtime.PSObject.Properties['version'] -and $llamaProvenance.cuda_runtime.version -eq '12.8.1'
+if ($asrProvenance.version -ne '0.4.1' -or $llamaProvenance.version -ne 'b11960' -or $llamaProvenance.commit -ne '8642541b255bfb5dc39cd351a178be09013a55d6' -or $llamaCudaBuild -ne '12.8' -or -not $llamaRuntimeMatches) {
+    throw '原生程序版本不匹配：需要 transcribe.cpp 0.4.1 和固定 b11960 / CUDA 12.8 本地构建；请运行 scripts/setup.ps1。'
+}
+$sharedMsvc = @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')
+$llamaDlls = @(Get-ChildItem -LiteralPath $llama -File -Filter '*.dll' | Where-Object {
+    $_.Name -in $llamaCoreDlls -or $_.Name -in $llamaOptionalDlls -or
+    $_.Name -match '^ggml-cpu(?:-[a-z0-9_-]+)?\.dll$'
+} | Select-Object -ExpandProperty Name)
+if (-not @($llamaDlls | Where-Object { $_ -like 'ggml-cpu*.dll' }).Count) { throw 'llama.cpp 构建产物缺少 CPU 后端，请重新运行 scripts/setup-llama.ps1。' }
+if ($llamaDlls -contains 'libomp.dll' -and -not (Test-Path -LiteralPath (Join-Path $llama 'licenses/LICENSE-LLVM-OpenMP') -PathType Leaf)) {
+    throw 'llama.cpp 使用 libomp.dll，但缺少 LLVM OpenMP 许可证。'
+}
+if (-not $llamaProvenance.PSObject.Properties['files']) { throw 'llama.cpp 缺少构建文件校验记录，请重新运行 scripts/setup-llama.ps1。' }
+$llamaLicenseFiles = @(Get-ChildItem -LiteralPath (Join-Path $llama 'licenses') -File)
+foreach ($name in $llamaDlls + @('llama-server.exe') + @($llamaLicenseFiles | ForEach-Object { 'licenses/' + $_.Name })) {
+    Assert-RecordedArtifact $llama $llamaProvenance.files $name
+}
+foreach ($name in $sharedCuda.Keys) {
+    $path = Join-Path $asr $name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $sharedCuda[$name]) {
+        throw "共享 CUDA 12.8 运行库缺失或校验失败：$path。请运行 scripts/setup.ps1。"
+    }
+}
 
-# 优先使用已准备的可分发静态包；不会下载或打包模型、测试音频。
-$knownFfmpegRoot = Join-Path $projectRoot '.tools/ffmpeg/ffmpeg-9.0.2-essentials_build'
-if (-not $Ffmpeg) {
-    $knownExecutable = Join-Path $knownFfmpegRoot 'bin/ffmpeg.exe'
-    if (Test-Path -LiteralPath $knownExecutable) { $Ffmpeg = $knownExecutable }
-    else {
-        $command = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
-        if ($command) { $Ffmpeg = $command.Source }
+if (-not $FfmpegDirectory) { $FfmpegDirectory = Join-Path $projectRoot '.tools/ffmpeg-shared' }
+$ffmpeg = [IO.Path]::GetFullPath($FfmpegDirectory)
+$ffmpegDllHashes = @{
+    'avcodec-63.dll' = 'c20d1a5b282a83b5bc586b65b23cf4837d83c2caa3b4dd4863ede2dd0f1858b5'
+    'avformat-63.dll' = '7c13073a52f7ad76cfc1c7e76d782e89d88c1155cf2500c3320d034b507605f6'
+    'avutil-61.dll' = 'cb50cdee16a5031090330997b51c016fe7788487150cd07fa20ddbda4d108d09'
+    'swresample-7.dll' = '12b907ddfff765e10c3b7da1a7985513dc9282c08953259f337f952f7b8a9f2a'
+}
+$ffmpegDlls = @($ffmpegDllHashes.Keys) + @('streamtrans-ffmpeg.dll')
+$ffmpegLicenseHash = 'da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768'
+$ffmpegManifest = Join-Path $ffmpeg '.streamtrans-ffmpeg.json'
+if (-not (Test-Path -LiteralPath $ffmpegManifest -PathType Leaf)) { throw '缺少 FFmpeg 动态库构建记录，请先执行 scripts/setup-ffmpeg.ps1。' }
+$ffmpegProvenance = Get-Content -LiteralPath $ffmpegManifest -Raw | ConvertFrom-Json
+if ($ffmpegProvenance.version -ne 'n9.0.2-39-g7adfbe40dc' -or $ffmpegProvenance.license -ne 'LGPLv3' -or
+    $ffmpegProvenance.archive_sha256 -ne 'e907b01fa4783913151237e37df2a10fa97d99a1598a021bf59d4ae62ffed4c0' -or
+    $ffmpegProvenance.backend -ne 'shared-library' -or $ffmpegProvenance.bridge.abi_version -ne 1) {
+    throw 'FFmpeg 构建记录版本不匹配，请重新执行 scripts/setup-ffmpeg.ps1。'
+}
+foreach ($name in $ffmpegDllHashes.Keys) {
+    $path = Join-Path $ffmpeg ('bin/' + $name)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $ffmpegDllHashes[$name]) {
+        throw "FFmpeg shared 固定组件校验失败：$path。请重新执行 scripts/setup-ffmpeg.ps1。"
     }
 }
-if (-not $Ffmpeg -or -not (Test-Path -LiteralPath $Ffmpeg -PathType Leaf)) { throw '找不到 FFmpeg，请通过 -Ffmpeg 指定可分发的 Windows x64 ffmpeg.exe。' }
-$Ffmpeg = (Resolve-Path -LiteralPath $Ffmpeg).Path
-$ffmpegVersion = (& $Ffmpeg -version | Out-String).Trim()
-if ($LASTEXITCODE -ne 0) { throw "FFmpeg 版本查询失败：$Ffmpeg。请指定可以独立运行的静态构建。" }
-if ($ffmpegVersion -match '--enable-nonfree') { throw "此 FFmpeg 包含 nonfree 组件，不可再分发：$Ffmpeg。请通过 -Ffmpeg 指定可分发构建及其许可证。" }
-if ($ffmpegVersion -match '--enable-shared') { throw "此 FFmpeg 依赖共享 DLL：$Ffmpeg。请通过 -Ffmpeg 指定可独立运行的静态构建。" }
-if (-not $FfmpegLicenseDirectory) {
-    $FfmpegLicenseDirectory = Split-Path $Ffmpeg -Parent
-    if ((Split-Path $FfmpegLicenseDirectory -Leaf) -ieq 'bin') { $FfmpegLicenseDirectory = Split-Path $FfmpegLicenseDirectory -Parent }
+if ((Get-FileHash -LiteralPath (Join-Path $ffmpeg 'LICENSE.txt') -Algorithm SHA256).Hash -ine $ffmpegLicenseHash) {
+    throw 'FFmpeg LGPLv3 许可证校验失败，请重新执行 scripts/setup-ffmpeg.ps1。'
 }
-if (-not (Test-Path -LiteralPath $FfmpegLicenseDirectory -PathType Container)) { throw '找不到 FFmpeg 许可证目录，请指定 -FfmpegLicenseDirectory。' }
-$ffmpegNotices = @(Get-ChildItem -LiteralPath $FfmpegLicenseDirectory -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE|README|SOURCE)' })
-if (-not @($ffmpegNotices | Where-Object { $_.Name -match '^(LICENSE|COPYING)' }).Count) { throw 'FFmpeg 目录中缺少许可证正文，请通过 -FfmpegLicenseDirectory 指定包含 LICENSE 或 COPYING 的目录。' }
-if (-not $FfmpegSourceUrl) {
-    foreach ($notice in $ffmpegNotices) {
-        $sourceMatch = [regex]::Match((Get-Content -LiteralPath $notice.FullName -Raw), '(?im)^Source Code:\s*(https://\S+)')
-        if ($sourceMatch.Success) { $FfmpegSourceUrl = $sourceMatch.Groups[1].Value; break }
-    }
+foreach ($name in @($ffmpegDlls | ForEach-Object { 'bin/' + $_ }) + @('LICENSE.txt','SOURCE.txt')) {
+    Assert-RecordedArtifact $ffmpeg $ffmpegProvenance.files $name 'FFmpeg' 'scripts/setup-ffmpeg.ps1'
 }
-if (-not $FfmpegSourceUrl -or $FfmpegSourceUrl -notmatch '^https://') { throw '缺少 FFmpeg 对应源码地址，请通过 -FfmpegSourceUrl 指定 HTTPS 源码地址。' }
 
 if (-not $MsvcRedistDirectory) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
@@ -79,7 +138,7 @@ if (-not $MsvcRedistDirectory) {
         if ($crt) { $MsvcRedistDirectory = $crt.FullName; break }
     }
 }
-foreach ($dll in @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')) {
+foreach ($dll in $sharedMsvc) {
     if (-not $MsvcRedistDirectory -or -not (Test-Path -LiteralPath (Join-Path $MsvcRedistDirectory $dll) -PathType Leaf)) { throw "MSVC app-local 运行库缺少 $dll，请指定完整的 x64 -MsvcRedistDirectory。" }
 }
 
@@ -88,22 +147,23 @@ $executable = Join-Path $projectRoot 'target/release/streamtrans.exe'
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw '找不到 target/release/streamtrans.exe，请先执行 .\scripts\build.ps1。' }
 $runtimeAsr = Join-Path $output 'runtime/asr'
 $runtimeLlama = Join-Path $output 'runtime/llama'
-$runtimeFfmpeg = Join-Path $output 'runtime/ffmpeg'
+$runtimeShared = Join-Path $output 'runtime'
 $licenseRoot = Join-Path $output 'licenses'
-New-Item -ItemType Directory -Path $output,$runtimeAsr,$runtimeLlama,$runtimeFfmpeg -Force | Out-Null
-foreach ($name in @('asr','llama','cuda-asr','cuda-llama','msvc','ffmpeg')) { New-Item -ItemType Directory -Path (Join-Path $licenseRoot $name) -Force | Out-Null }
-Copy-Item -LiteralPath $executable -Destination $output
-Get-ChildItem -LiteralPath $asr -File -Filter '*.dll' | Copy-Item -Destination $runtimeAsr
-Get-ChildItem -LiteralPath $llama -File -Filter '*.dll' | Copy-Item -Destination $runtimeLlama
-Copy-Item -LiteralPath (Join-Path $llama 'llama-server.exe') -Destination $runtimeLlama
-Copy-Item -LiteralPath $Ffmpeg -Destination (Join-Path $runtimeFfmpeg 'ffmpeg.exe')
-foreach ($destination in @($output,$runtimeAsr,$runtimeLlama)) { Get-ChildItem -LiteralPath $MsvcRedistDirectory -File -Filter '*.dll' | Copy-Item -Destination $destination }
+Assert-EmptyOutput
+New-Item -ItemType Directory -Path $output,$runtimeAsr,$runtimeLlama -Force | Out-Null
+foreach ($name in @('asr','llama','cuda','msvc','ffmpeg')) { New-Item -ItemType Directory -Path (Join-Path $licenseRoot $name) -Force | Out-Null }
+Copy-Exclusive $executable (Join-Path $output 'streamtrans.exe')
+foreach ($name in $asrDlls) { Copy-Exclusive (Join-Path $asr $name) (Join-Path $runtimeAsr $name) }
+foreach ($name in ($llamaDlls + @('llama-server.exe'))) { Copy-Exclusive (Join-Path $llama $name) (Join-Path $runtimeLlama $name) }
+foreach ($name in $sharedCuda.Keys) { Copy-Exclusive (Join-Path $asr $name) (Join-Path $runtimeShared $name) }
+foreach ($name in $ffmpegDlls) { Copy-Exclusive (Join-Path $ffmpeg ('bin/' + $name)) (Join-Path $runtimeShared $name) }
+foreach ($name in $sharedMsvc) { Copy-Exclusive (Join-Path $MsvcRedistDirectory $name) (Join-Path $runtimeShared $name) }
+Copy-Exclusive (Join-Path $MsvcRedistDirectory 'vcruntime140.dll') (Join-Path $output 'vcruntime140.dll')
 Get-ChildItem -LiteralPath (Join-Path $asr 'licenses') -File | Copy-Item -Destination (Join-Path $licenseRoot 'asr')
-Get-ChildItem -LiteralPath (Join-Path $asr 'licenses/cuda-asr') -File | Copy-Item -Destination (Join-Path $licenseRoot 'cuda-asr')
-Get-ChildItem -LiteralPath (Join-Path $llama 'licenses') -File | Where-Object { $_.Name -ne 'cuda-12.4-EULA.html' } | Copy-Item -Destination (Join-Path $licenseRoot 'llama')
-Copy-Item -LiteralPath (Join-Path $llama 'licenses/cuda-12.4-EULA.html') -Destination (Join-Path $licenseRoot 'cuda-llama')
+foreach ($name in @('cuda_cudart-LICENSE','libcublas-LICENSE')) { Copy-Exclusive (Join-Path $asr ('licenses/cuda-asr/' + $name)) (Join-Path $licenseRoot ('cuda/' + $name)) }
+$llamaLicenseFiles | Copy-Item -Destination (Join-Path $licenseRoot 'llama')
 Get-ChildItem -LiteralPath $msvcLicenses -File | Copy-Item -Destination (Join-Path $licenseRoot 'msvc')
-$ffmpegNotices | Copy-Item -Destination (Join-Path $licenseRoot 'ffmpeg')
+foreach ($name in @('LICENSE.txt','SOURCE.txt')) { Copy-Exclusive (Join-Path $ffmpeg $name) (Join-Path $licenseRoot ('ffmpeg/' + $name)) }
 foreach ($name in @('README.md','LICENSE','LICENSE-MIT','Cargo.lock')) {
     $source = Join-Path $projectRoot $name
     if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination $output }
@@ -132,14 +192,15 @@ cd /d "%~dp0"
 exit /b %errorlevel%
 '@ | Set-Content -LiteralPath (Join-Path $output 'start.cmd') -Encoding ascii
 $provenance = [ordered]@{
-    asr = (Get-Content -LiteralPath (Join-Path $asr '.streamtrans-runtime.json') -Raw | ConvertFrom-Json)
-    llama = (Get-Content -LiteralPath (Join-Path $llama '.streamtrans-runtime.json') -Raw | ConvertFrom-Json)
-    ffmpeg = @{ version = $ffmpegVersion; source_url = $FfmpegSourceUrl; executable_sha256 = (Get-FileHash -LiteralPath $Ffmpeg -Algorithm SHA256).Hash.ToLowerInvariant() }
+    asr = $asrProvenance
+    llama = $llamaProvenance
+    shared_cuda = @{
+        version = '12.8.1'; cudart = '12.8.90'; cublas = '12.8.4.1'; directory = 'runtime'
+        manifest = $asrProvenance.cuda_manifest; packages = $asrProvenance.cuda_packages
+        files = @($sharedCuda.Keys | Sort-Object | ForEach-Object { @{ path = 'runtime/' + $_; sha256 = $sharedCuda[$_] } })
+    }
+    ffmpeg = $ffmpegProvenance
     msvc = @{ version = (Get-Item -LiteralPath (Join-Path $MsvcRedistDirectory 'vcruntime140.dll')).VersionInfo.FileVersion; license_url = 'https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/' }
-}
-if ($Ffmpeg -ieq (Join-Path $knownFfmpegRoot 'bin/ffmpeg.exe')) {
-    $provenance.ffmpeg.binary_url = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip'
-    $provenance.ffmpeg.archive_sha256 = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
 }
 $provenance | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $output 'THIRD_PARTY.json') -Encoding utf8
 $files = @(Get-ChildItem -LiteralPath $output -File -Recurse | Sort-Object FullName | ForEach-Object {

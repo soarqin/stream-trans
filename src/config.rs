@@ -1,3 +1,5 @@
+#[cfg(not(windows))]
+use std::path::Path;
 use std::{fmt, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, ensure};
@@ -36,8 +38,13 @@ pub struct Config {
     pub asr_library: PathBuf,
     #[arg(long, default_value_os_t = default_llama_server())]
     pub llama_server: PathBuf,
+    #[cfg(not(windows))]
     #[arg(long, default_value_os_t = default_ffmpeg())]
     pub ffmpeg: PathBuf,
+    /// FFmpeg 9.0 进程内解码桥；配套 DLL 与此文件放在同一目录。
+    #[cfg(windows)]
+    #[arg(long, default_value_os_t = default_ffmpeg_library())]
+    pub ffmpeg_library: PathBuf,
     /// CUDA 设备编号。
     #[arg(long, default_value_t = 0)]
     pub gpu: u32,
@@ -130,22 +137,36 @@ fn default_llama_server() -> PathBuf {
     if packaged.is_file() {
         packaged
     } else if cfg!(windows) {
-        ".tools/llama/llama-server.exe".into()
+        ".tools/llama-cuda128/llama-server.exe".into()
     } else {
         ".tools/llama/llama-server".into()
     }
 }
 
+#[cfg(not(windows))]
 fn default_ffmpeg() -> PathBuf {
-    let packaged = bundled_path(if cfg!(windows) {
-        "runtime/ffmpeg/ffmpeg.exe"
+    packaged_ffmpeg(&bundled_path("runtime")).unwrap_or_else(|| "ffmpeg".into())
+}
+
+#[cfg(not(windows))]
+fn packaged_ffmpeg(runtime: &Path) -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
     } else {
-        "runtime/ffmpeg/ffmpeg"
-    });
+        "ffmpeg"
+    };
+    [runtime.join(name), runtime.join("ffmpeg").join(name)]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+#[cfg(windows)]
+fn default_ffmpeg_library() -> PathBuf {
+    let packaged = bundled_path("runtime/streamtrans-ffmpeg.dll");
     if packaged.is_file() {
         packaged
     } else {
-        "ffmpeg".into()
+        ".tools/ffmpeg-shared/bin/streamtrans-ffmpeg.dll".into()
     }
 }
 
@@ -160,6 +181,27 @@ fn default_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn packaged_ffmpeg_prefers_shared_runtime_and_accepts_legacy_layout() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let runtime = temporary.path();
+        let name = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        assert!(packaged_ffmpeg(runtime).is_none());
+        std::fs::create_dir(runtime.join("ffmpeg"))?;
+        let legacy = runtime.join("ffmpeg").join(name);
+        std::fs::write(&legacy, [])?;
+        assert_eq!(packaged_ffmpeg(runtime), Some(legacy));
+        let shared = runtime.join(name);
+        std::fs::write(&shared, [])?;
+        assert_eq!(packaged_ffmpeg(runtime), Some(shared));
+        Ok(())
+    }
 
     #[test]
     fn non_loopback_binding_requires_a_valid_request_key() {

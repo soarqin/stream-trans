@@ -12,3 +12,17 @@ __pycache__/
 *.safetensors
 *.pt
 *.log
+
+# Native build outputs
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.o
+*.a
+*.so
+*.so.*
+*.dylib

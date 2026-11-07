@@ -14,9 +14,13 @@
 
 ASR 和 LLM 必须运行在 GPU 上，不自动回退 CPU。Windows 分发包包含 ASR 原生库、llama.cpp、CUDA 运行库和 FFmpeg；运行机器仍需兼容的 NVIDIA 驱动。项目不内置模型权重，首次启动默认从 **Hugging Face** 下载三个固定版本，也可通过 `--model-source modelscope` 选择 **ModelScope**。模型由 Rust 下载、校验并转换 ASR 缓存，后续复用并支持离线启动。来源、精度与限制见 [模型说明](docs/models.md)，打包与部署见 [分发说明](docs/distribution.md)。
 
+Windows 分发目录将一套共享的 CUDA 12.8 运行库和 FFmpeg 解码 DLL 放在 `runtime` 根目录，ASR 与 llama.cpp 各自的 ggml 保留在独立子目录。llama.cpp 固定为 b11960 源码，使用 CUDA Toolkit 12.8.1 本地编译，与 ASR 使用相同版本的 CUDA 运行库。文件上传在进程内解码，不启动 FFmpeg 子进程；实时录音直接传输 PCM，不经过 FFmpeg。
+
+2026-11-07 的 Windows 实测发行目录缩小约 44.3%；9.12 秒 WAV 的独立规范化耗时中位数由 32.1 ms 降至 6.7 ms。构建、预热方法、音频完整性、模块来源和限制见 [共享运行库验证](docs/shared-runtime-20261107.md)。
+
 ## Windows 安装与启动
 
-源码构建需要 Windows x64、Rust stable 和 Visual Studio 2022 C++ Build Tools（「使用 C++ 的桌面开发」组件）。Rust 构建不需要 CUDA Toolkit 或 NVCC。运行需要兼容随包 CUDA 运行库的 NVIDIA 驱动，GPU 需支持原生 BF16，显存需同时容纳 ASR、LLM 及推理缓存。
+源码构建需要 Windows x64、Rust stable 和 Visual Studio 2022 C++ Build Tools（「使用 C++ 的桌面开发」组件）。构建 llama.cpp 前需安装 CMake 并将其加入 `PATH`；Ninja 可从 `PATH` 获取，也可复用 Visual Studio 随带的组件。构建脚本将固定的 CUDA 12.8.1 编译组件下载到项目内 `.tools/llama-build-cuda128/cuda`，无须全局安装 CUDA Toolkit，也不使用 Python。运行机器只需兼容随包 CUDA 运行库的 NVIDIA 驱动；GPU 需支持原生 BF16，显存需同时容纳 ASR、LLM 及推理缓存。
 
 在项目根目录运行：
 
@@ -25,7 +29,11 @@ powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
 .\target\release\streamtrans.exe
 ```
 
-安装脚本下载并校验固定版本的 ASR 原生库、llama.cpp 和 CUDA 运行库，然后编译 Rust 发布版本。FFmpeg 需放入 `PATH`，或启动时通过 `--ffmpeg` 指定路径。首次安装需要联网访问上游下载站点和 crates.io；模型在服务首次启动时下载。开发模式从项目根目录启动，并保留 `.tools` 中的运行库和 `models` 缓存。
+安装脚本下载并校验固定版本的 ASR 原生库、llama.cpp 源码、CUDA 组件和 FFmpeg 9.0 LGPL 共享库，构建 llama.cpp 和小型音频桥接 DLL，再编译 Rust 发布版本。FFmpeg 头文件和导入库只用于构建，不进入分发包；不使用 Python、pkg-config 或 bindgen。首次安装需要联网访问上游下载站点和 crates.io；模型在服务首次启动时下载。开发模式从项目根目录启动，并保留 `.tools` 中的运行库和 `models` 缓存。
+
+Windows 安装通过 `scripts/setup-cuda-runtime.ps1` 为两个后端准备相同版本的 CUDA 运行 DLL，复用下载缓存。开发目录各自保留 DLL 副本，制作分发目录时仅携带一套共享副本。CUDA Toolkit 和 NVCC 只用于构建机器，不进入分发目录。
+
+单独构建 llama.cpp 可运行 `scripts/setup-llama.ps1 -Jobs 4`，默认输出到 `.tools/llama-cuda128`；`-OutputDirectory` 可覆盖此目录。
 
 重新构建或运行检查：
 
@@ -39,7 +47,7 @@ cargo fmt --check
 指定 GPU 或 FFmpeg 路径：
 
 ```powershell
-.\target\release\streamtrans.exe --gpu 0 --ffmpeg C:\Tools\ffmpeg\bin\ffmpeg.exe
+.\target\release\streamtrans.exe --gpu 0 --ffmpeg-library .tools/ffmpeg-shared/bin/streamtrans-ffmpeg.dll
 ```
 
 `--llama-server` 和 `--asr-library` 可覆盖默认原生程序路径。发行模式自动查找可执行文件旁的 `runtime` 目录；部署时复制完整分发目录，无须在运行机器安装 Rust、C++ 编译器、CUDA Toolkit 或 Python：
@@ -49,7 +57,7 @@ powershell -ExecutionPolicy Bypass -File scripts/dist.ps1
 .\dist\StreamTrans\streamtrans.exe
 ```
 
-打包前需准备允许再分发的 FFmpeg 构建及其许可证和源码获取信息；可通过 `scripts/dist.ps1 -Ffmpeg ...` 指定。打包脚本拒绝标记为 `nonfree` 的构建，完整参数见 [分发说明](docs/distribution.md)。
+FFmpeg DLL 默认由 `scripts/setup-ffmpeg.ps1` 准备；可通过 `scripts/dist.ps1 -FfmpegDirectory ...` 指定已经构建并带有来源清单的目录。分发包保留对应许可证和源码获取信息，完整参数见 [分发说明](docs/distribution.md)。Windows 的旧 `--ffmpeg` 和打包脚本的 `-Ffmpeg` EXE 参数改用 DLL 参数。
 
 仅下载模型而不加载模型或启动服务：
 
@@ -182,6 +190,8 @@ curl http://127.0.0.1:3000/v1/audio/translations \
 ```
 
 仅识别响应保留同样的原文、分段、音频时长、模型和耗时字段，`mode` 为 `transcribe`，`translation` 和 `target_language` 均为 `null`，`elapsed_ms.translation` 为 `0`。当前服务端仍预加载 ASR 和 LLM，仅识别只跳过 LLM 推理，不释放其常驻显存。
+
+`elapsed_ms.audio_decode` 单独报告文件解码、重采样及规范化写入耗时，已计入 `elapsed_ms.total`；不包含在 `asr` 或 `translation` 中。
 
 静音或没有检测到语音时，返回 `200`，`text` 为空字符串，`segments` 为空数组，不调用 LLM。翻译模式的 `translation` 为空字符串，仅识别模式仍为 `null`。目标语言代码会规范化为语言名称；其他合法名称原样传给模型，译文质量取决于模型能力。
 

@@ -164,6 +164,12 @@ impl Llm {
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            if let Some(shared) = directory
+                .parent()
+                .filter(|path| path.join("cudart64_12.dll").is_file())
+            {
+                paths.push(shared.to_owned());
+            }
             paths.extend(std::env::split_paths(
                 &std::env::var_os("PATH").unwrap_or_default(),
             ));
@@ -777,9 +783,9 @@ struct ServerProcess {
 }
 impl ServerProcess {
     fn spawn(command: &mut Command, gpu: usize, api_key: String) -> Result<Self> {
-        let child = command
-            .spawn()
-            .context("无法启动打包的 llama-server，请检查可执行文件及同目录 CUDA 动态库")?;
+        let child = command.spawn().context(
+            "无法启动打包的 llama-server，请检查可执行文件、后端依赖库及共享 runtime 目录",
+        )?;
         let mut process = Self {
             child: Some(child),
             readers: Vec::new(),
