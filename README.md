@@ -77,6 +77,12 @@ FFmpeg DLL 默认由 `scripts/setup-ffmpeg.ps1` 准备；可通过 `scripts/dist
 
 全部参数见 `.\target\release\streamtrans.exe --help`。开发模式默认缓存目录为当前工作目录下的 `models`；检测到发行布局时，默认缓存目录为可执行文件旁的 `models`，可用 `--cache-dir` 覆盖。模型清单按来源和模型规格独立生成，切换来源或模型版本时保留原有缓存。默认接口地址为 `127.0.0.1:3000`；设置请求 key 后，可显式绑定非回环地址供其他机器访问。
 
+服务端通过 `--min-volume-db` 设置低音量门限，默认 `-30`，单位为 dBFS RMS，接受不大于 `0` 的有限数值。门限越接近 `0`，过滤越强；例如设为 `-40` 可保留更多安静声音。门限适用于文件上传和实时流，低于门限的人声也会被过滤，详见 [音量过滤说明](docs/models.md#fsmn-vad-分段)。
+
+```powershell
+.\target\release\streamtrans.exe --min-volume-db -40
+```
+
 ### 请求 key 与跨机器访问
 
 服务端可通过 `--request-key` 或环境变量 `STREAMTRANS_REQUEST_KEY` 设置请求 key。未设置时，仅允许绑定回环地址；设置后，可用 `--bind 0.0.0.0:3000` 或 `--bind [::]:3000` 监听非回环地址。设置 key 不会自动修改默认监听地址。

@@ -75,6 +75,7 @@ pub struct Runtime {
     engine: Arc<Mutex<Option<Engine>>>,
     alive: AtomicBool,
     inference_timeout: Duration,
+    min_audio_mean_square: f64,
 }
 
 struct CancelStartup(Arc<AtomicBool>);
@@ -133,6 +134,7 @@ impl Runtime {
         let config = config.clone();
         let startup_timeout = Duration::from_secs(config.startup_timeout_seconds);
         let inference_timeout = Duration::from_secs(config.inference_timeout_seconds);
+        let min_audio_mean_square = 10.0f64.powf(config.min_volume_db / 10.0);
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelStartup(cancelled.clone());
         let engine = timeout(
@@ -181,6 +183,7 @@ impl Runtime {
             engine: Arc::new(Mutex::new(Some(engine?))),
             alive: AtomicBool::new(true),
             inference_timeout,
+            min_audio_mean_square,
         })
     }
 
@@ -312,6 +315,7 @@ fn stream_audio(
     source: &str,
     target: Option<&str>,
     inference_timeout: Duration,
+    min_audio_mean_square: f64,
 ) -> Result<()> {
     // CPU model weights are shared, but no VAD operation acquires the GPU mutex.
     let vad = engine
@@ -333,6 +337,7 @@ fn stream_audio(
             timeout: inference_timeout,
         },
         StreamLimits::default(),
+        min_audio_mean_square,
     )
 }
 
@@ -360,6 +365,7 @@ fn report_stream_error(output: &mpsc::Sender<Value>, reported: &AtomicBool, caus
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_pipeline<V: FnMut(&[f32], bool) -> Result<VadUpdate>, I: SpeechInference>(
     mut input: mpsc::Receiver<StreamInput>,
     output: mpsc::Sender<Value>,
@@ -368,6 +374,7 @@ fn stream_pipeline<V: FnMut(&[f32], bool) -> Result<VadUpdate>, I: SpeechInferen
     mut vad: V,
     inference: I,
     limits: StreamLimits,
+    min_audio_mean_square: f64,
 ) -> Result<()> {
     let (jobs_tx, jobs_rx) = mpsc::channel(limits.segments);
     let (cancel, cancellation) = watch::channel(false);
@@ -407,6 +414,7 @@ fn stream_pipeline<V: FnMut(&[f32], bool) -> Result<VadUpdate>, I: SpeechInferen
             &mut vad,
             &budget,
             cancellation,
+            min_audio_mean_square,
         );
         if !matches!(&collection, Ok(true)) {
             let _ = cancel.send(true);
@@ -436,6 +444,7 @@ fn collect_speech<V: FnMut(&[f32], bool) -> Result<VadUpdate>>(
     vad: &mut V,
     budget: &SpeechBudget,
     mut cancel: watch::Receiver<bool>,
+    min_audio_mean_square: f64,
 ) -> Result<bool> {
     let runtime = tokio::runtime::Handle::current();
     let started = Instant::now();
@@ -455,11 +464,12 @@ fn collect_speech<V: FnMut(&[f32], bool) -> Result<VadUpdate>>(
         let Some(next) = next else {
             return Ok(false);
         };
-        let (samples, is_final) = match next {
+        let (mut samples, is_final) = match next {
             StreamInput::Audio(samples) => (samples, false),
             StreamInput::Finish => (Vec::new(), true),
         };
         ensure!(samples.len() <= 16_000, "流式音频块不能超过 1 秒");
+        suppress_quiet_audio(&mut samples, min_audio_mean_square);
         pcm.append(&samples)?;
         let vad_started = Instant::now();
         let update = vad(&samples, is_final)?;
@@ -649,6 +659,21 @@ fn infer_speech<I: SpeechInference>(
     }
 }
 
+// Stream ingress supplies aligned 100 ms blocks; only the final block may be short.
+fn suppress_quiet_audio(samples: &mut [f32], min_mean_square: f64) {
+    const FRAME_SAMPLES: usize = 320; // 20 ms at 16 kHz.
+    for frame in samples.chunks_mut(FRAME_SAMPLES) {
+        let mean_square = frame
+            .iter()
+            .map(|&sample| f64::from(sample).powi(2))
+            .sum::<f64>()
+            / frame.len() as f64;
+        if mean_square < min_mean_square {
+            frame.fill(0.0);
+        }
+    }
+}
+
 #[derive(Default)]
 struct PcmBuffer {
     start: u64,
@@ -703,6 +728,7 @@ impl Backend for Runtime {
         let source = source.to_owned();
         let target = target.map(str::to_owned);
         let inference_timeout = self.inference_timeout;
+        let min_audio_mean_square = self.min_audio_mean_square;
         // The caller's task owns the GPU permit and awaits this worker even after disconnect.
         tokio::task::spawn_blocking(move || {
             stream_audio(
@@ -712,6 +738,7 @@ impl Backend for Runtime {
                 &source,
                 target.as_deref(),
                 inference_timeout,
+                min_audio_mean_square,
             )
         })
         .await
@@ -724,6 +751,7 @@ impl Backend for Runtime {
         let language = language.to_owned();
         let engine = self.engine.clone();
         let deadline = Instant::now() + self.inference_timeout;
+        let min_audio_mean_square = self.min_audio_mean_square;
         // 等待原生调用结束才归还 GPU 许可；超时通过模型内部回调协作取消。
         tokio::task::spawn_blocking(move || -> Result<Recognition> {
             let mut reader = hound::WavReader::open(&path).context("无法读取规范化 WAV")?;
@@ -735,10 +763,11 @@ impl Backend for Runtime {
                     && spec.sample_format == hound::SampleFormat::Int,
                 "音频必须为 16 kHz 单声道 PCM16 WAV"
             );
-            let samples = reader
+            let mut samples = reader
                 .samples::<i16>()
                 .map(|s| s.map(|v| f32::from(v) / 32768.0))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            suppress_quiet_audio(&mut samples, min_audio_mean_square);
             let mut guard = engine
                 .lock()
                 .map_err(|_| anyhow::anyhow!("模型状态异常，请重启服务"))?;
@@ -949,6 +978,7 @@ mod tests {
                     samples: 64_000,
                     segments: 2,
                 },
+                0.001,
             )
         });
         audio(&input_tx, 20).await;
@@ -1010,6 +1040,7 @@ mod tests {
                     samples: 64_000,
                     segments: 2,
                 },
+                0.001,
             )
         });
         audio(&input_tx, 20).await;
@@ -1062,6 +1093,7 @@ mod tests {
                 vad,
                 inference,
                 StreamLimits::default(),
+                0.001,
             )
         });
         audio(&input_tx, 20).await;
@@ -1109,6 +1141,7 @@ mod tests {
                     vad,
                     inference,
                     StreamLimits::default(),
+                    0.001,
                 )
             });
             input_tx
@@ -1146,5 +1179,53 @@ mod tests {
         assert!(pcm.samples.is_empty());
         assert_eq!(pcm.received, 6);
         Ok(())
+    }
+
+    #[test]
+    fn quiet_audio_suppression_preserves_loud_frames_length_and_short_tail() {
+        let speech: Vec<_> = (0..320)
+            .map(|index| if index % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        let mut samples = vec![0.02; 320];
+        samples.extend_from_slice(&speech);
+        samples.extend_from_slice(&[0.01; 17]);
+        let length = samples.len();
+
+        suppress_quiet_audio(&mut samples, 0.001);
+
+        assert_eq!(samples.len(), length);
+        assert!(samples[..320].iter().all(|&sample| sample == 0.0));
+        assert_eq!(&samples[320..640], speech.as_slice());
+        assert!(samples[640..].iter().all(|&sample| sample == 0.0));
+    }
+
+    #[test]
+    fn quiet_audio_suppression_uses_rms_and_keeps_the_exact_threshold() {
+        let mut isolated_peak = vec![0.0; 320];
+        isolated_peak[0] = 0.5;
+        suppress_quiet_audio(&mut isolated_peak, 0.001);
+        assert!(isolated_peak.iter().all(|&sample| sample == 0.0));
+
+        let mut threshold_tail = vec![0.0; 250];
+        threshold_tail[0] = 0.5;
+        let original = threshold_tail.clone();
+        suppress_quiet_audio(&mut threshold_tail, 0.001);
+        assert_eq!(threshold_tail, original);
+
+        suppress_quiet_audio(&mut [], 0.001);
+    }
+
+    #[test]
+    fn minimum_volume_override_changes_which_audio_is_suppressed() {
+        for (db, suppressed) in [(-40.0, false), (-30.0, true), (-20.0, true)] {
+            let mut samples = vec![0.02; 320];
+            let min_mean_square = 10.0f64.powf(db / 10.0);
+            suppress_quiet_audio(&mut samples, min_mean_square);
+            assert!(
+                samples
+                    .iter()
+                    .all(|&x| x == if suppressed { 0.0 } else { 0.02 })
+            );
+        }
     }
 }

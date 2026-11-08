@@ -57,6 +57,9 @@ pub struct Config {
     /// 连续录音的总时长上限（秒）；0 表示不限，音频缓冲仍有界。
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=86_400))]
     pub max_stream_seconds: u32,
+    /// 低音量过滤门限（dBFS RMS，须为不大于 0 的有限数）；低于门限的 20 ms 帧置为静音。
+    #[arg(long, default_value_t = -30.0, allow_negative_numbers = true)]
+    pub min_volume_db: f64,
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(2048..=4096))]
     pub context_size: u32,
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=3072))]
@@ -90,6 +93,10 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.min_volume_db.is_finite() && self.min_volume_db <= 0.0,
+            "min-volume-db 必须为不大于 0 的有限数（dBFS）"
+        );
         if let Some(key) = &self.request_key {
             ensure!(
                 !key.is_empty() && key.len() <= 256 && key.bytes().all(|b| b.is_ascii_graphic()),
@@ -271,6 +278,30 @@ mod tests {
         assert!(config.validate().is_err());
         config.request_key = Some("x".repeat(256));
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn minimum_volume_defaults_to_minus_30_and_validates_overrides() {
+        let config = Config::try_parse_from(["streamtrans"]).unwrap();
+        assert_eq!(config.min_volume_db, -30.0);
+        for db in ["-40", "-25.5", "0"] {
+            let config = Config::try_parse_from(["streamtrans", "--min-volume-db", db]).unwrap();
+            assert_eq!(config.min_volume_db, db.parse::<f64>().unwrap());
+            assert!(config.validate().is_ok());
+        }
+        for db in ["0.1", "NaN", "inf", "-inf"] {
+            let config =
+                Config::try_parse_from(["streamtrans".to_owned(), format!("--min-volume-db={db}")])
+                    .unwrap();
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("min-volume-db")
+            );
+        }
+        assert!(Config::try_parse_from(["streamtrans", "--min-volume-db", "quiet"]).is_err());
     }
 
     #[test]
