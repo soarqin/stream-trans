@@ -19,6 +19,11 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; background: transparent; }
 body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  text-align: center;
   color: var(--output-text);
   font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   font-size: var(--output-font-size);
