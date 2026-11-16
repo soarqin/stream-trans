@@ -58,7 +58,7 @@ pub struct Config {
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=86_400))]
     pub max_stream_seconds: u32,
     /// 低音量过滤门限（dBFS RMS，须为不大于 0 的有限数）；低于门限的 20 ms 帧置为静音。
-    #[arg(long, default_value_t = -30.0, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = -40.0, allow_negative_numbers = true)]
     pub min_volume_db: f64,
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(2048..=4096))]
     pub context_size: u32,
@@ -281,10 +281,10 @@ mod tests {
     }
 
     #[test]
-    fn minimum_volume_defaults_to_minus_30_and_validates_overrides() {
+    fn minimum_volume_defaults_to_minus_40_and_validates_overrides() {
         let config = Config::try_parse_from(["streamtrans"]).unwrap();
-        assert_eq!(config.min_volume_db, -30.0);
-        for db in ["-40", "-25.5", "0"] {
+        assert_eq!(config.min_volume_db, -40.0);
+        for db in ["-45", "-25.5", "0"] {
             let config = Config::try_parse_from(["streamtrans", "--min-volume-db", db]).unwrap();
             assert_eq!(config.min_volume_db, db.parse::<f64>().unwrap());
             assert!(config.validate().is_ok());
